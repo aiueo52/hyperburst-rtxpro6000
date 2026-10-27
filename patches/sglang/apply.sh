@@ -3,7 +3,7 @@
 #
 #   patches/sglang/apply.sh <path to a clone of https://github.com/jpezzulli/sglang-rtxpro6000>
 #
-# Creates branch `flash-next-fast` at 16e5682aad (branch pennyroyal-main-sm120-final, 2026-08-27) and
+# Creates branch `flash-next-series` at 16e5682aad (branch pennyroyal-main-sm120-final, 2026-08-27) and
 # `git am`s the series. The resulting tree equals the production tree of 2026-10-02 (7118260ce3, the
 # 0121 merge; through 0105 it is the 2026-09-08 measured tree codex/perf-v1 @ 7b4d539f9b) except for
 # publication edits: genericised home paths and project names in scripts/docs, generated text stripped
@@ -17,6 +17,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BASE=16e5682aad6e3335f38ec8d5711176278f12a086
 cd "$REPO"
 git cat-file -e "$BASE^{commit}" 2>/dev/null || { echo "base commit $BASE not found; git fetch origin first" >&2; exit 1; }
-git checkout -b flash-next-fast "$BASE"
+git checkout -b flash-next-series "$BASE"
 git am --whitespace=nowarn "$HERE"/series/*.patch
 echo "applied $(ls "$HERE"/series/*.patch | wc -l) patches on $BASE"

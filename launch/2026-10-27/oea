@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+# Switch OEA in this tree's running Flash-Next server without a restart.
+#   oea on | off | rows 16|8|2 | status
+#     on / off   OEA with the server's own k0 (its launch value OEA_K0, 6; the caller's OEA_K0 is not
+#                read) / standard pruning only
+#     rows <n>   the live-row gate: OEA only in verify calls with at least n live rows (2..16;
+#                16 = G1, start default; 8 = G2; 2 = G0). Keeps on/off as it is.
+#     status     the server's current state (k0, rows) from its last acknowledgement, starting, or stopped
+# Switch between generations (between requests), not while one is running: a switch that lands in the middle of a
+# verify step can give that one step a k0 that differs between the kernel's thread blocks.
+# Writes "seq=<n> mode=oea|prod" or "seq=<n> min_rows=<n>" to the server's control file (polled every 0.25 s by the
+# oea-ctl thread in oea_prologue.py) and waits for the matching line in <control file>.status.jsonl. The status file
+# starts with the launcher's launch line (pid), then the server's start line (first MoE call: the FlashInfer autotune,
+# before the CUDA graphs are captured) and serving line (the scheduler has captured every graph). Before the serving
+# line the server does not read the control file, so oea writes nothing and says starting.
+set -euo pipefail
+CTL="${SGLANG_OEA_CTL_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/flash-next-fast/hyperpro/oea/flash-next.ctl}"
+STATUS="$CTL.status.jsonl"
+WAIT_SEC="${OEA_WAIT_SEC:-5}"
+
+py() {  # py show <json line> | py status <status file> | py check <status file>
+  python3 -I -B - "$@" <<'PY'
+import json, os, sys, time
+
+
+def hhmmss(t):
+    return time.strftime("%H:%M:%S", time.localtime(t or 0))
+
+
+def state_text(cfg):
+    rows = cfg.get("min_rows")
+    gate = {16: "G1", 8: "G2", 2: "G0"}.get(rows, "")
+    rows_text = "active with at least %s live rows%s" % (rows, " = " + gate if gate else "")
+    if cfg.get("mode") == "oea":
+        return "on (k0=%s, %s)" % (cfg.get("k0"), rows_text)
+    return "off (standard computation; gate when enabled: %s)" % rows_text
+
+
+def show(rec):
+    cfg = rec.get("cfg") or {}
+    when = hhmmss(rec.get("t"))
+    if "error" in rec:
+        print("Switch rejected (%s): %s" % (when, rec["error"]))
+        print("OEA: still %s" % state_text(cfg))
+        return 1
+    if rec.get("start") or rec.get("serving"):
+        print("OEA: %s  (unchanged since startup at %s; no switches yet)" % (state_text(cfg), when))
+    else:
+        print("OEA: %s  switched at %s" % (state_text(cfg), when))
+    return 0
+
+
+def records(path):
+    """The current server's lines: from serve-fast.sh's last launch line on (every line if there is none)."""
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    recs = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            recs.append(rec)
+    launches = [i for i, rec in enumerate(recs) if rec.get("launch") is True]
+    return recs[launches[-1]:] if launches else recs
+
+
+def alive(pid, t):
+    """The record's process still runs: kill -0 finds it, it is not a zombie (died, not reaped yet), and it is not
+    younger than its own record (the pid was reused by a later process)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        age = uptime - int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return True
+    if fields[0] == "Z":
+        return False
+    return not (type(t) in (int, float) and age < time.time() - t - 5)
+
+
+def phase(recs):
+    """(kind, record): none / stopped / launching / capturing / serving."""
+    if not recs:
+        return "none", None
+    for rec in recs:
+        pid = rec.get("pid")
+        if type(pid) is int and pid > 0 and not alive(pid, rec.get("t")):
+            return "stopped", rec
+    last = recs[-1]
+    if last.get("launch") is True:
+        return "launching", last
+    if last.get("start") is True:
+        return "capturing", last
+    return "serving", last  # serving line, an acknowledgement, or a server that writes neither
+
+
+WAIT = "Switch only after startup finishes (when 'oea status' no longer says 'starting')."
+STOPPED = ("The hyperpro server with OEA is stopped. (Server pid %s is no longer running. "
+           "oea has no effect on a server launched with OEA=0.)")
+
+
+def status(path):
+    kind, rec = phase(records(path))
+    if kind == "none":
+        print("OEA: unchanged since startup (serve-fast.sh defaults: on, k0=6, at least 16 live rows = G1). No acknowledgement yet.")
+        return 0
+    if kind == "stopped":
+        print(STOPPED % rec["pid"])
+        return 0
+    if kind == "launching":
+        cfg = rec.get("cfg")
+        start = "OEA will start %s. " % state_text(cfg) if isinstance(cfg, dict) else ""
+        print("The hyperpro server is starting (since %s; loading the model; pid %s). %s%s"
+              % (hhmmss(rec.get("t")), rec.get("pid"), start, WAIT))
+        return 0
+    if kind == "capturing":
+        print("The hyperpro server is starting (capturing CUDA graphs; switches are accepted after startup). "
+              "OEA will start %s. %s" % (state_text(rec.get("cfg") or {}), WAIT))
+        return 0
+    return show(rec)
+
+
+def check(path):
+    kind, rec = phase(records(path))
+    if kind == "stopped":
+        print(STOPPED % rec["pid"] + " No switch was written.", file=sys.stderr)
+        return 1
+    if kind in ("launching", "capturing"):
+        print("The hyperpro server is starting. No switch was written. " + WAIT, file=sys.stderr)
+        return 1
+    return 0
+
+
+mode, arg = sys.argv[1], sys.argv[2]
+if mode == "show":
+    sys.exit(show(json.loads(arg)))
+sys.exit({"status": status, "check": check}[mode](arg))
+PY
+}
+
+case "${1:-status}" in
+  on) body="mode=oea" ;;
+  off) body="mode=prod" ;;
+  rows)
+    rows="${2:-}"
+    case "$rows" in
+      [2-9]|1[0-6]) ;;
+      *) echo "usage: oea rows <2..16>   (16 = G1 default, 8 = G2, 2 = G0)" >&2; exit 2 ;;
+    esac
+    body="min_rows=$rows" ;;
+  status)
+    if [ ! -e "$CTL" ]; then
+      echo "The hyperpro server has not started yet. ($CTL is missing)"
+      exit 0
+    fi
+    py status "$STATUS"
+    exit ;;
+  *) echo "usage: oea {on|off|rows <2..16>|status}   (switch between generations)" >&2; exit 2 ;;
+esac
+
+if [ ! -d "$(dirname "$CTL")" ]; then
+  echo "The control file directory is missing. Is the hyperpro server running? ($CTL)" >&2
+  exit 1
+fi
+py check "$STATUS" || exit 1   # starting or stopped: nothing is written
+seq=$(date +%s%N)
+tmp="$CTL.tmp.$$"
+printf 'seq=%s %s\n' "$seq" "$body" > "$tmp"
+mv -f "$tmp" "$CTL"   # atomic replace: the poller never reads a half-written line
+deadline=$((SECONDS + WAIT_SEC))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if [ -f "$STATUS" ]; then
+    line=$(grep -F "\"seq\": $seq," "$STATUS" | tail -n 1 || true)
+    if [ -n "$line" ]; then
+      py show "$line"
+      exit
+    fi
+  fi
+  sleep 0.1
+done
+echo "No acknowledgement after ${WAIT_SEC} seconds. Is the hyperpro server running?" >&2
+exit 1

@@ -189,7 +189,7 @@ used are not included.
 Commands below assume:
 
 ```bash
-export REPO=/path/to/flash-next-rtxpro6000
+export REPO=/path/to/hyperburst-rtxpro6000
 export SGLANG_DIR=/path/to/sglang-rtxpro6000          # serving checkout with .venv (reproduce.md)
 export MTP_MODEL_DIR=$HOME/models/RadixArk/Qwen3.8-Flash-Next-NVFP4
 export TARGET_MODEL="$MTP_MODEL_DIR"
@@ -219,7 +219,7 @@ export SGLANG_DUMP_TREE=$WORK/sglang-dump
 ```
 
 `apply.sh` creates branch `flash-next-mtp-dump` in a new git worktree of the serving clone and
-applies the patches there. The serving checkout is not touched and stays on `flash-next-fast`.
+applies the patches there. The serving checkout is not touched and stays on `flash-next-series`.
 There is no second virtualenv: the dump server runs from the serving checkout's `.venv`, and
 setting `PYTHONPATH=$SGLANG_DUMP_TREE/python` makes the worktree's patched files the ones that get
 imported (the editable install's finder is appended to `sys.meta_path`, so `PYTHONPATH` wins).

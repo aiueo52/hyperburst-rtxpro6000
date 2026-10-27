@@ -1,9 +1,9 @@
-flash-next-rtxpro6000
+hyperburst-rtxpro6000
 Copyright 2026 aiueo52 and contributors
 
 This repository is licensed under the Apache License, Version 2.0 (see LICENSE), except where a
 file or patch hunk is derived from third-party code under another license as listed below, and
-except the two data files in tokenmaps/public/ (CC BY-SA 4.0, see "Data-derived file" below). The
+except the four data files in tokenmaps/public/ (CC BY-SA 4.0, see "Data-derived files" below). The
 full texts of the other code licenses are in licenses/.
 
 ===================================================================================================
@@ -20,6 +20,10 @@ Apache-2.0 projects this work builds on (notices reproduced under section 4(d) o
   graphs, HiCache/NIXL persistence and qualification are John Pezzulli's work in that fork (see
   its CHANGES.md and PROVENANCE.md). patches/sglang/ contains only our changes on top of it. The fork carries SGLang's
   Apache-2.0 LICENSE and has no NOTICE file of its own.
+  The 2026-10-27 release is published on the flash-next-fast branch at commit
+  d21289fb923ac65b7b913b73c6e32a2fa2601e7b. patches/sglang/perf-1027-core.diff records its
+  python/, test/ and docs/ changes against the same base fork at
+  16e5682aad6e3335f38ec8d5711176278f12a086.
 
 - SGLang, Copyright 2023-2024 SGLang Team, https://github.com/sgl-project/sglang
   Upstream of the base fork. Patch context lines and the kernel snapshots in kernels/sglang/
@@ -56,6 +60,8 @@ Apache-2.0 projects this work builds on (notices reproduced under section 4(d) o
   patches/flashinfer/ (and the copies under bench/bench/moe_smallm/patches/, plus the GDN patch
   kernels/microbench/glue_e/gdn_wy_T16_strided.patch, which the SGLang series also adds as
   bench/glue_e/gdn_wy_T16_strided.patch) modify files shipped in the flashinfer-python wheel.
+  The 2026-10-27 diffs in patches/flashinfer/2026-10-27/ document the vt and vtoea overlays:
+  seven wheel files changed in each variant (14 modified copies), plus one file added in vt only.
   None of the touched files is one of the third-party components listed in FlashInfer's LICENSE
   appendix. Their own headers:
     flashinfer/data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
@@ -64,10 +70,12 @@ Apache-2.0 projects this work builds on (notices reproduced under section 4(d) o
       Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.  (Apache-2.0)
     flashinfer/data/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
       Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.  (Apache-2.0)
-    flashinfer/fused_moe/core.py
+    flashinfer/fused_moe/core.py and flashinfer/jit/fused_moe.py
       Copyright (c) 2025 by FlashInfer team.  (Apache-2.0)
-    flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
-      no file header; covered by FlashInfer's LICENSE and NOTICE above.
+    flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py and flashinfer/jit/core.py
+      no upstream file header; covered by FlashInfer's LICENSE and NOTICE above.
+  The added flashinfer/fused_moe/tactic_rows_policy.py (vt only) is Apache-2.0,
+  Copyright 2026 aiueo52 and contributors.
 
 - NVIDIA TensorRT-LLM, Copyright (c) NVIDIA CORPORATION, https://github.com/NVIDIA/TensorRT-LLM
   (Apache-2.0), via the FlashInfer MoE files above (they derive from TensorRT-LLM).
@@ -85,7 +93,8 @@ Code under other licenses (patch hunks and context lines derived from these proj
   SGLang's python/sglang/kernels/ops/attention/fla/ directory is adapted from FLA. Hunks and context
   lines of these files in this repository are derived from it:
     python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py
-      patches/sglang/series/0001-*.patch, patches/sglang/perf-v1-core.diff
+      patches/sglang/series/0001-*.patch, patches/sglang/perf-v1-core.diff,
+      patches/sglang/perf-1027-core.diff
     python/sglang/kernels/ops/attention/fla/layernorm_gated.py
       ("Adapt from ... fla/modules/layernorm_gated.py; Copyright (c) 2024, Tri Dao. Based on the
       Triton LayerNorm tutorial"): patches/sglang/series/0071-*.patch and its revert 0072-*.patch
@@ -100,7 +109,7 @@ Code under other licenses (patch hunks and context lines derived from these proj
   Adapted from causal-conv1d ... and vLLM ...") is derived from it. Hunks and context lines of that
   file in this repository are derived from it:
     patches/sglang/series/0023-*.patch, patches/sglang/series/0045-*.patch,
-    patches/sglang/perf-v1-core.diff
+    patches/sglang/perf-v1-core.diff, patches/sglang/perf-1027-core.diff
   The new test test/registered/kernels/ops/mamba/test_causal_conv1d_chain_parallel.py added by
   0045 is our own code (Apache-2.0).
 
@@ -111,18 +120,20 @@ the patches change is listed in patches/sglang/MODIFICATIONS.md; the patches the
 change.
 
 ===================================================================================================
-Data-derived file: the public draft token map (tokenmaps/public/)
+Data-derived files: the public token maps (tokenmaps/public/)
 ===================================================================================================
 
 tokenmaps/public/public_49152.pt is a sorted list of 49,152 token ids of the Qwen3.8-Flash-Next
-tokenizer, ranked by how often each id occurs when public text is tokenised. It contains no text,
-no counts and no other content of the sources; public_49152.sources.json records which files were
-read (repository, revision, file, sha256, licence) and the per-source document, character and token
-totals. Whether a frequency-ranked id list is an adaptation of the source text under the
-ShareAlike licence of Wikipedia is not settled. To be safe, these two data files are offered under
+tokenizer, ranked by how often each id occurs when public text is tokenised.
+tokenmaps/public/public_32768.pt is a 32,768-id subset of that map, derived from the same sources.
+The maps contain no text, no counts and no other content of the sources;
+public_49152.sources.json and public_32768.sources.json record which files were read (repository,
+revision, file, sha256, licence) and the per-source document, character and token totals. Whether a
+frequency-ranked id list is an adaptation of the source text under the ShareAlike licence of
+Wikipedia is not settled. To be safe, these four data files are offered under
 the Creative Commons Attribution-ShareAlike 4.0 International licence
 (https://creativecommons.org/licenses/by-sa/4.0/) instead of Apache-2.0, with the attributions
-below. The scripts that build the map (tokenmaps/public/fetch_public.sh,
+below. The companion map-building scripts (tokenmaps/public/fetch_public.sh,
 tokenmaps/public/prep_public.py, tokenmaps/build_hot_vocab.py) are Apache-2.0 like the rest of
 the repository; they download the sources from their publishers and redistribute none of them.
 
@@ -147,7 +158,8 @@ Attributions:
   NousResearch/hermes-function-calling-v1 (Apache-2.0), and the source trees of python/cpython
   v3.13.0 (PSF-2.0), golang/go go1.23.0 (BSD-3-Clause), facebook/react v18.3.1 (MIT), vuejs/core
   v3.5.12 (MIT), tokio-rs/tokio tokio-1.40.0 (MIT) and curl/curl curl-8_10_1 (curl licence).
-  Exact revisions and file hashes: tokenmaps/public/public_49152.sources.json.
+  Exact revisions and file hashes: tokenmaps/public/public_49152.sources.json and
+  tokenmaps/public/public_32768.sources.json.
 
 ===================================================================================================
 Other references (not redistributed here)

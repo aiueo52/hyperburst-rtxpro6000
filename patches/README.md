@@ -5,17 +5,46 @@ Two layers of changes, both applied on top of pinned upstream versions:
 | directory | applies to | what |
 |---|---|---|
 | `sglang/` | [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) @ `16e5682aad6e3335f38ec8d5711176278f12a086` (branch `pennyroyal-main-sm120-final`, 2026-08-27) | 121 `git format-patch` patches (`series/`), plus two squashed diffs limited to `python/`, `test/`, `docs/`: `perf-1002-core.diff` (all 121 = the 2026-10-02 production build) and `perf-v1-core.diff` (0001–0105 = the 2026-09-08 measured tree that the September numbers refer to) |
-| `sglang/mtp-dump/` | branch `flash-next-fast` after the series above | 9 patches adding the training-data dump hook used by `mtp-train/`; `apply.sh` puts them on branch `flash-next-mtp-dump` in a separate worktree. See `docs/train-your-own-mtp-head.md` §4 |
+| `sglang/perf-1027-core.diff` | the same pinned SGLang base above | standalone cumulative `python/`, `test/`, `docs/` diff for the 2026-10-27 release (`d21289f`), without the five removed files below |
+| `sglang/mtp-dump/` | branch `flash-next-series` after the 121-patch series above (2026-10-02 tree) | 9 patches adding the training-data dump hook used by `mtp-train/`; `apply.sh` puts them on branch `flash-next-mtp-dump` in a separate worktree. See `docs/train-your-own-mtp-head.md` §4 |
 | `flashinfer/` | the installed `flashinfer-python==0.6.17` wheel (in the SGLang venv's `site-packages`) | 8 CUDA/C++ source patches to the CUTLASS fused-MoE path (JIT-compiled), 1 patch to the vendored GDN WY decode wrapper, 1 patch to the JIT loader (`FLASHINFER_P2_NO_NINJA`) |
+
+The 2026-10-27 release is [`d21289f`](https://github.com/aiueo52/sglang-rtxpro6000/tree/d21289fb923ac65b7b913b73c6e32a2fa2601e7b).
+Apply `perf-1027-core.diff` alone to the pristine pinned base, not after the series. It leaves out
+the five files that the release removes for licensing reasons, so it contains none of their
+content, not even as deletion hunks. Run `git apply /path/to/patches/sglang/perf-1027-core.diff`,
+then remove those five files by path in the SGLang checkout:
+
+```bash
+git rm -- \
+  python/sglang/kernels/aot/csrc/elementwise/fused_add_rms_norm_kernel.mu \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer.cpp \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer_gpu.cu \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer.h \
+  python/sglang/kernels/ops/diffusion/ext/mesh_processor/mesh_processor.cpp
+```
+
+These are the five licensing removals in the fork's `MODIFICATIONS.md`, “Removed base-fork
+files”; see the [mirrored notice](sglang/MODIFICATIONS.md#removed-base-fork-files) for the reasons.
+Together, the two steps reproduce `d21289f` exactly under `python/`, `test/`, and `docs/`.
+The removed upstream test is not a licensing removal; its deletion is in the core diff.
+The numbered series and earlier core diffs remain unchanged.
+`patches/sglang/apply.sh` now creates the `flash-next-series` branch.
+
+The current FlashInfer 0.6.17 vt/vtoea changes are recorded in the
+[2026-10-27 overlay diffs](flashinfer/2026-10-27/), separately from the unchanged 01–10 patches
+below. The fork's `tools/assemble_flashinfer.py` assembles both variants from the installed wheel.
 
 ## SGLang series
 
 ```bash
 git clone https://github.com/jpezzulli/sglang-rtxpro6000
-patches/sglang/apply.sh sglang-rtxpro6000        # creates branch flash-next-fast and git-am's the series
+patches/sglang/apply.sh sglang-rtxpro6000        # creates branch flash-next-series and git-am's the 121-patch series
 ```
 
-- The series is the linearised first-parent history of the production branch; two side-branch
+- `flash-next-series` is the 121-patch series ending at the 2026-10-02 production tree, not
+  the current `flash-next-fast` release with its 2026-10-27 update and release maintenance.
+  The series is the linearised first-parent history of that production branch; two side-branch
   merges (0040: FP8 HC mix weights + fused shared-expert gate_up; 0121: XA1 on ST1 into the RS
   package) are each folded into a single patch whose commit message lists the side-branch commits.
   After 0105 the tree is the 2026-09-08 measured tree; after 0121 it is the 2026-10-02 production
@@ -29,15 +58,15 @@ patches/sglang/apply.sh sglang-rtxpro6000        # creates branch flash-next-fas
   (the generated text was stripped). The development shell scripts that drove the `dbg/` and `prof-pdl/` experiments
   (`dbg/*.sh` in 0061–0066, `prof-pdl/gpu_session*.sh` in 0074) are left out: they managed the
   GPU of the development machine and are not needed to build or serve.
-- `MODIFICATIONS.md` lists every upstream file the series (and the FlashInfer patches) modify, as the
-  Apache-2.0 §4(b) change notice.
+- `MODIFICATIONS.md` is the Apache-2.0 §4(b) change notice for the SGLang series, the FlashInfer
+  patches and overlays, and the 2026-10-27 update including release maintenance.
 - `SERIES.md` lists every patch with its date and subject. Almost all speed features are behind
   environment flags that default to **off**; `launch/serve-fast.sh` turns on the adopted set.
   Rejected experiments stay in the series (flag-gated, default off) so their numbers can be
   reproduced; see `docs/rejected.md`.
 - Besides `python/` and `test/`, the series also adds the experiment records we used while
   developing (`bench/…` micro-benchmarks, `dbg/`, `prof-pdl/`, `adaptive_*.json`). They are not
-  needed at runtime. The two `perf-*-core.diff` files exclude them.
+  needed at runtime. The `perf-*-core.diff` files exclude them.
 - New unit tests are under `test/registered/unit/…` and `test/srt/…`; most CPU tests run with
   `CUDA_VISIBLE_DEVICES=9 python -m pytest …` (a non-existent GPU index; an empty value trips a
   string-indexing path in SGLang's test utils).

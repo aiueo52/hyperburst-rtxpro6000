@@ -1,0 +1,2168 @@
+--- a/flashinfer/data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/flashinfer/data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -1,3 +1,4 @@
++// Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ /*
+  * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+  *
+@@ -68,6 +69,8 @@
+ #include "3rdparty/cub/cub.cuh"
+ #endif
+ 
++#include <cstdlib>
++
+ using namespace tensorrt_llm::kernels;
+ using namespace tensorrt_llm::common;
+ 
+@@ -346,6 +349,19 @@
+                      smart_routing, cluster_rank, cluster_size, num_experts_smem);
+ }
+ 
++// A0: cub::BlockRadixRank's temp storage is COUNTER_LANES * BLOCK_THREADS * PACKING_RATIO
++// digit counters, i.e. 64 KiB at BLOCK_SIZE=32 / RADIX_BITS=10 (512 experts + sentinel).
++// Zeroing and raking that with 32 threads costs ~15 us -- more than the 3-kernel fallback it
++// replaces.  BlockRadixRankMatch keeps one counter per (digit, warp) instead (~4 KiB here) and
++// ranks with warp match_any, so it is ~10x cheaper at this block size.  Only the >=10-bit tier
++// (which upstream never reached) switches over; every existing configuration keeps
++// cub::BlockRadixRank bit-for-bit.
++template <int BLOCK_SIZE, int LOG2_NUM_EXPERTS>
++using FusedPrologueRadixRank =
++    ::cuda::std::conditional_t<(LOG2_NUM_EXPERTS >= 10),
++                               cub::BlockRadixRankMatch<BLOCK_SIZE, LOG2_NUM_EXPERTS, false>,
++                               cub::BlockRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS, false>>;
++
+ template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
+ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
+     int const* const token_selected_experts, int* const permuted_row_to_unpermuted_row,
+@@ -395,7 +411,7 @@
+   // that to elide the binary search
+ 
+   // sort the expert map
+-  using BlockRadixRank = cub::BlockRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS, false>;
++  using BlockRadixRank = FusedPrologueRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS>;
+   extern __shared__ unsigned char temp_storage[];
+   auto& sort_temp = *reinterpret_cast<typename BlockRadixRank::TempStorage*>(temp_storage);
+ 
+@@ -446,7 +462,7 @@
+   int const blocks = (num_tokens + threads - 1) / threads;
+   TLLM_CHECK_WITH_INFO(blocks == 1, "Current implementation requires single block");
+ 
+-  using BlockRadixRank = cub::BlockRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS, false>;
++  using BlockRadixRank = FusedPrologueRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS>;
+   size_t shared_size = sizeof(typename BlockRadixRank::TempStorage);
+ 
+   cudaLaunchConfig_t config;
+@@ -542,6 +558,10 @@
+       func = &fusedBuildExpertMapsSortFirstTokenBlockSize<8, LOG2_NUM_EXPERTS>;
+       break;
+     }
++    case 10: {
++      func = &fusedBuildExpertMapsSortFirstTokenBlockSize<10, LOG2_NUM_EXPERTS>;
++      break;
++    }
+     default: {
+       TLLM_LOG_TRACE("Top-K value %d does not have supported fused moe prologues",
+                      experts_per_token);
+@@ -554,15 +574,27 @@
+               stream);
+ }
+ 
++// FLASHINFER_MOE_FUSED_PROLOGUE=0 forces the unfused 3-kernel prologue (A0 kill switch).
++inline bool fusedPrologueEnabled() {
++  static bool const enabled = [] {
++    char const* v = std::getenv("FLASHINFER_MOE_FUSED_PROLOGUE");
++    return !(v && v[0] == '0' && v[1] == '\0');
++  }();
++  return enabled;
++}
++
+ bool fusedBuildExpertMapsSortFirstToken(
+     int const* token_selected_experts, int* permuted_row_to_unpermuted_row,
+     int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
+     int64_t const num_tokens, int const num_experts_per_node, int const experts_per_token,
+     int const start_expert, int const end_expert, bool enable_pdl, cudaStream_t stream) {
++  if (!fusedPrologueEnabled()) {
++    return false;
++  }
+   // We need enough bits to represent [0, num_experts_per_node+1] (inclusive) i.e.
+   // num_experts_per_node + 2 values This is floor(log2(num_experts_per_node+1)) + 1
+   int expert_log = static_cast<int>(log2(num_experts_per_node + 1)) + 1;
+-  if (expert_log <= 9) {
++  if (expert_log <= 10) {
+     auto funcs = std::array{&fusedBuildExpertMapsSortFirstTokenBlockSize<1>,
+                             &fusedBuildExpertMapsSortFirstTokenBlockSize<2>,
+                             &fusedBuildExpertMapsSortFirstTokenBlockSize<3>,
+@@ -571,7 +603,8 @@
+                             &fusedBuildExpertMapsSortFirstTokenBlockSize<6>,
+                             &fusedBuildExpertMapsSortFirstTokenBlockSize<7>,
+                             &fusedBuildExpertMapsSortFirstTokenBlockSize<8>,
+-                            &fusedBuildExpertMapsSortFirstTokenBlockSize<9>};
++                            &fusedBuildExpertMapsSortFirstTokenBlockSize<9>,
++                            &fusedBuildExpertMapsSortFirstTokenBlockSize<10>};
+ 
+     return funcs[expert_log - 1](token_selected_experts, permuted_row_to_unpermuted_row,
+                                  unpermuted_row_to_permuted_row, expert_first_token_offset,
+@@ -1150,12 +1183,72 @@
+   return alpha_scale_ptr_array;
+ }
+ 
++// ======================= G1: active-group packing =======================
++//
++// Write the D active experts into CUTLASS groups [0, D) instead of leaving them scattered over
++// all `num_experts_per_node` slots, and shorten the group list to the host-side bound
++// `expanded_num_rows` (an active expert owns at least one permuted row).  Nothing in CUTLASS
++// changes: the sm120 array kernel re-derives every TMA descriptor from the per-group
++// `dA/dB/layout_SFA/layout_SFB` + problem shape, and every per-group array the epilogue reads
++// (alpha scales, and FINALIZE's source-token / router-scale / bias pointers) is indexed by the
++// group index `l`, so a permuted group order is an ordinary input.
++//
++// The win is the persistent tile scheduler's linear group scan
++// (`sm90_tile_scheduler_group.hpp: get_work_idx_m_and_n` reads 32 problem shapes per iteration
++// of dependent global loads); at E=512 with D~28 it walks ~13x more of the list than it needs.
++inline int moePackGroupsEnabled() {
++  static int const v = [] {
++    char const* s = std::getenv("FLASHINFER_MOE_PACK_GROUPS");
++    return (s && s[0] != '0') ? 1 : 0;
++  }();
++  return v;
++}
++
++// How much the group list must shorten (`expanded_num_rows * ratio <= num_experts_per_node`)
++// before packing is allowed.  On the A0+A3 base this had to default to 4: the rank computation
++// added ~0.6 us to a short, latency-bound prologue, which the 3.2x shortening at W16 did not
++// cover.  On top of G2-2 the prologue also carries `num_tokens * k` row blocks, so the rank
++// hides inside it entirely (measured: prologue -0.12 us at W4, -0.08 us at W16) and packing
++// wins at both widths -- hence the default of 1.  Raise it to re-enable the old gate.
++inline int moePackMinRatio() {
++  static int const v = [] {
++    char const* s = std::getenv("FLASHINFER_MOE_PACK_MIN_RATIO");
++    int n = s ? std::atoi(s) : 1;
++    return n < 1 ? 1 : n;
++  }();
++  return v;
++}
++
++// CTA tile M of an sm120 grouped-GEMM tactic.  Every sm120 FP4 tile is 128 or 256 rows
++// (`cutlass_heuristic.cpp: get_candidate_configs_sm120`); anything else disables packing.
++inline int g1CtaTileM(cutlass_extensions::CutlassGemmConfig const& cfg) {
++  if (!cfg.is_tma_warp_specialized) return 0;
++  switch (cfg.tile_config_sm120) {
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x128x128B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x128x64B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x256x64B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x128x256B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x32x128B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x32x64B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x64x128B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape128x64x64B:
++      return 128;
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape256x128x64B:
++    case cutlass_extensions::CutlassTileConfigSM120::CtaShape256x128x128B:
++      return 256;
++    default:
++      return 0;
++  }
++}
++
+ template <class BSConfig>
+ __device__ void setupFP4BlockScalingFactors(
+     TmaWarpSpecializedGroupedGemmInput& layout_info, int expert, int gemm_m, int gemm_n, int gemm_k,
+     TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat,
+     TmaWarpSpecializedGroupedGemmInput::ElementSF const* weight_block_scale,
+-    int64_t num_tokens_before_expert) {
++    int64_t num_tokens_before_expert, int out_idx = -1) {
++  // G1: `out_idx` is the CUTLASS group index, which packing decouples from the expert id.
++  if (out_idx < 0) out_idx = expert;
+   assert(layout_info.fpX_block_scaling_factors_stride_act);
+   assert(layout_info.fpX_block_scaling_factors_stride_weight);
+ 
+@@ -1165,14 +1258,14 @@
+       layout_info.fpX_block_scaling_factors_stride_weight);
+   if (layout_info.swap_ab) {
+     // M & N swapped for transpose
+-    stride_act_ptr[expert] = BSConfig::tile_atom_to_shape_SFB(
++    stride_act_ptr[out_idx] = BSConfig::tile_atom_to_shape_SFB(
+         cute::make_shape((int)gemm_n, (int)gemm_m, (int)gemm_k, (int)1));
+-    stride_weight_ptr[expert] = BSConfig::tile_atom_to_shape_SFA(
++    stride_weight_ptr[out_idx] = BSConfig::tile_atom_to_shape_SFA(
+         cute::make_shape((int)gemm_n, (int)gemm_m, (int)gemm_k, (int)1));
+   } else {
+-    stride_act_ptr[expert] = BSConfig::tile_atom_to_shape_SFA(
++    stride_act_ptr[out_idx] = BSConfig::tile_atom_to_shape_SFA(
+         cute::make_shape((int)gemm_m, (int)gemm_n, (int)gemm_k, (int)1));
+-    stride_weight_ptr[expert] = BSConfig::tile_atom_to_shape_SFB(
++    stride_weight_ptr[out_idx] = BSConfig::tile_atom_to_shape_SFB(
+         cute::make_shape((int)gemm_m, (int)gemm_n, (int)gemm_k, (int)1));
+   }
+ 
+@@ -1187,10 +1280,10 @@
+       std::is_same_v<BSConfig, TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>
+           ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+           : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+-  layout_info.fpX_block_scaling_factors_act[expert] =
++  layout_info.fpX_block_scaling_factors_act[out_idx] =
+       fp4_act_flat + getOffsetActivationSF(expert, num_tokens_before_expert, gemm_k, scaling_type);
+ 
+-  layout_info.fpX_block_scaling_factors_weight[expert] =
++  layout_info.fpX_block_scaling_factors_weight[out_idx] =
+       weight_block_scale + getOffsetWeightSF(expert, gemm_n, gemm_k, scaling_type);
+ }
+ 
+@@ -1265,12 +1358,15 @@
+     layout_info.ptr_d[out_idx] = safe_inc_ptr(output, num_tokens_before_expert * gemm_n);
+   }
+   if (layout_info.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE) {
+-    layout_info.fused_finalize_epilogue.ptr_source_token_index[expert] =
++    // G1: `sm90_visitor_scatter.hpp:268` reads `ptr_index[l]` and the launcher gives the alpha /
++    // router-scale arrays an int64_t L-stride of 1, i.e. all of these are indexed by the CUTLASS
++    // group index, not the expert id.
++    layout_info.fused_finalize_epilogue.ptr_source_token_index[out_idx] =
+         permuted_row_to_unpermuted_row + num_tokens_before_expert;
+-    layout_info.fused_finalize_epilogue.ptr_router_scales[expert] =
++    layout_info.fused_finalize_epilogue.ptr_router_scales[out_idx] =
+         router_scales + num_tokens_before_expert;
+     if (layout_info.fused_finalize_epilogue.ptr_bias != nullptr) {
+-      layout_info.fused_finalize_epilogue.ptr_bias[expert] = bias + gemm_n * expert;
++      layout_info.fused_finalize_epilogue.ptr_bias[out_idx] = bias + gemm_n * expert;
+     }
+   }
+   if (layout_info.int4_groupwise_params.enabled) {
+@@ -1286,55 +1382,49 @@
+   }
+ }
+ 
+-// TODO Some of this setup could be cached
++// A3: the per-expert descriptor body, factored out of computeStridesTmaWarpSpecializedKernel so
++// the fused routing prologue can run exactly the same code.  Behaviour is unchanged: the
++// early-out for empty experts becomes an `if`, and the PDL intrinsics stay in the kernels.
+ template <class T, class WeightType, class OutputType, class ScaleBiasType>
+-__global__ void computeStridesTmaWarpSpecializedKernel(
+-    int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
+-    TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens,
+-    int64_t expanded_num_tokens, int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k,
+-    int64_t const num_experts_per_node, T const* gemm1_in, T const* gemm2_in,
++__device__ void computeStridesTmaWarpSpecializedForExpert(
++    int const expert, int64_t const num_tokens_before_expert,
++    int64_t const num_tokens_including_expert,
++    TmaWarpSpecializedGroupedGemmInput& layout_info1,
++    TmaWarpSpecializedGroupedGemmInput& layout_info2, int64_t gemm1_n, int64_t gemm1_k,
++    int64_t gemm2_n, int64_t gemm2_k, T const* gemm1_in, T const* gemm2_in,
+     WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
+     float const* alpha_scale_flat2,
+     TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
+     TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
+     ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
+     OutputType* gemm2_output, float const* router_scales,
+-    int const* permuted_row_to_unpermuted_row) {
+-  // First, compute the global tid. We only need 1 thread per expert.
+-  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (expert >= num_experts_per_node) {
+-    return;
+-  }
+-
+-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-  cudaGridDependencySynchronize();
+-#endif
+-
+-  // Both gemms use the same token offset
+-  auto const num_tokens_before_expert = expert_first_token_offset[expert];
+-  auto const num_tokens_including_expert = expert_first_token_offset[expert + 1];
++    int const* permuted_row_to_unpermuted_row,
++    // G1: the CUTLASS group indices for this expert's two GEMMs (== `expert` upstream).
++    int out_idx1 = -1, int out_idx2 = -1) {
+   auto const num_tokens_to_expert = num_tokens_including_expert - num_tokens_before_expert;
+   auto const gemm_m = num_tokens_to_expert;
++  if (out_idx1 < 0) out_idx1 = expert;
++  if (out_idx2 < 0) out_idx2 = expert;
+ 
+   // M and N transposed since we are using the #tokens as the N dimension
+-  layout_info1.shape_info.problem_shapes[expert] =
++  layout_info1.shape_info.problem_shapes[out_idx1] =
+       TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
+           layout_info1.swap_ab ? gemm1_n : gemm_m, layout_info1.swap_ab ? gemm_m : gemm1_n,
+           gemm1_k);
+-  layout_info2.shape_info.problem_shapes[expert] =
++  layout_info2.shape_info.problem_shapes[out_idx2] =
+       TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
+           layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n,
+           gemm2_k);
+ 
+   if (layout_info1.int4_groupwise_params.enabled) {
+-    layout_info1.int4_groupwise_params.shape.problem_shapes[expert] =
++    layout_info1.int4_groupwise_params.shape.problem_shapes[out_idx1] =
+         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
+             UnderlyingProblemShape(layout_info1.swap_ab ? gemm1_n : gemm_m,
+                                    layout_info1.swap_ab ? gemm_m : gemm1_n, gemm1_k);
+   }
+ 
+   if (layout_info2.int4_groupwise_params.enabled) {
+-    layout_info2.int4_groupwise_params.shape.problem_shapes[expert] =
++    layout_info2.int4_groupwise_params.shape.problem_shapes[out_idx2] =
+         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
+             UnderlyingProblemShape(layout_info2.swap_ab ? gemm2_n : gemm_m,
+                                    layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
+@@ -1346,27 +1436,24 @@
+   // block scaling factors, strides, pointers) is only needed for active experts.
+   // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
+   if (gemm_m == 0) {
+-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-    cudaTriggerProgrammaticLaunchCompletion();
+-#endif
+     return;
+   }
+ 
+   if (alpha_scale_flat1 && alpha_scale_flat2) {
+-    layout_info1.alpha_scale_ptr_array[expert] = alpha_scale_flat1 + expert;
+-    layout_info2.alpha_scale_ptr_array[expert] = alpha_scale_flat2 + expert;
++    layout_info1.alpha_scale_ptr_array[out_idx1] = alpha_scale_flat1 + expert;
++    layout_info2.alpha_scale_ptr_array[out_idx2] = alpha_scale_flat2 + expert;
+   }
+ 
+   auto setupIfSelected = [&](auto bs_config, auto quant_type) {
+     if (quant_type.fc1.weight_block_scale) {
+       setupFP4BlockScalingFactors<decltype(bs_config)>(
+           layout_info1, expert, gemm_m, gemm1_n, gemm1_k, fp4_act_flat1,
+-          quant_type.fc1.weight_block_scale, num_tokens_before_expert);
++          quant_type.fc1.weight_block_scale, num_tokens_before_expert, out_idx1);
+     }
+     if (quant_type.fc2.weight_block_scale) {
+       setupFP4BlockScalingFactors<decltype(bs_config)>(
+           layout_info2, expert, gemm_m, gemm2_n, gemm2_k, fp4_act_flat2,
+-          quant_type.fc2.weight_block_scale, num_tokens_before_expert);
++          quant_type.fc2.weight_block_scale, num_tokens_before_expert, out_idx2);
+     }
+   };
+ 
+@@ -1383,24 +1470,832 @@
+   assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
+   assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
+   assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
+-  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
+-  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
++  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, out_idx1);
++  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, out_idx2);
+ 
+   computeTmaWarpSpecializedInputPointers(
+       layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert, gemm1_in, weights1,
+       reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
+           quant_params.groupwise.fc1.weight_scales),
+-      bias1, gemm1_output, nullptr, nullptr, expert);
++      bias1, gemm1_output, nullptr, nullptr, out_idx1);
+   computeTmaWarpSpecializedInputPointers(
+       layout_info2, gemm_m, gemm2_n, gemm2_k, num_tokens_before_expert, expert, gemm2_in, weights2,
+       reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
+           quant_params.groupwise.fc2.weight_scales),
+-      bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
++      bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, out_idx2);
++}
++
++// G1: write a zero-token problem shape so CUTLASS produces no tiles for this group.  Used for
++// the group slots left over after the active experts are packed to the front.
++__device__ inline void writeEmptyProblemShape(TmaWarpSpecializedGroupedGemmInput& layout_info,
++                                              int out_idx, int64_t gemm_n, int64_t gemm_k) {
++  layout_info.shape_info.problem_shapes[out_idx] =
++      TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
++          layout_info.swap_ab ? gemm_n : 0, layout_info.swap_ab ? 0 : gemm_n, gemm_k);
++}
++
++// TODO Some of this setup could be cached
++template <class T, class WeightType, class OutputType, class ScaleBiasType>
++__global__ void computeStridesTmaWarpSpecializedKernel(
++    int64_t const* expert_first_token_offset, TmaWarpSpecializedGroupedGemmInput layout_info1,
++    TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t num_tokens,
++    int64_t expanded_num_tokens, int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k,
++    int64_t const num_experts_per_node, T const* gemm1_in, T const* gemm2_in,
++    WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
++    float const* alpha_scale_flat2,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
++    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
++    OutputType* gemm2_output, float const* router_scales,
++    int const* permuted_row_to_unpermuted_row) {
++  // First, compute the global tid. We only need 1 thread per expert.
++  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
++  if (expert >= num_experts_per_node) {
++    return;
++  }
++
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  cudaGridDependencySynchronize();
++#endif
++
++  computeStridesTmaWarpSpecializedForExpert<T, WeightType, OutputType, ScaleBiasType>(
++      expert, expert_first_token_offset[expert], expert_first_token_offset[expert + 1],
++      layout_info1, layout_info2, gemm1_n, gemm1_k, gemm2_n, gemm2_k, gemm1_in, gemm2_in, weights1,
++      weights2, alpha_scale_flat1, alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2, quant_params,
++      bias1, bias2, gemm1_output, gemm2_output, router_scales, permuted_row_to_unpermuted_row);
++
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  cudaTriggerProgrammaticLaunchCompletion();
++#endif
++}
++
++
++// ================= A3: routing prologue fused with the TMA descriptor setup ================
++//
++// computeStridesTmaWarpSpecializedKernel only depends on expert_first_token_offset, which the
++// routing prologue has just produced -- so it is one extra launch (2.9-4.5 us on sm120, entirely
++// serial dependency) per MoE call for work the prologue block already has in registers.
++//
++// The fusion keeps the strides phase exactly as parallel as it was (grid = ceil(E/32) blocks of
++// 32 threads, one thread per expert).  Every block re-runs the (cheap, deterministic) prologue so
++// that no grid-wide barrier is needed; only block 0 writes the routing maps to global memory.
++//
++// Restricted to BLOCK_SIZE = 32 (num_tokens <= 32, i.e. decode/verify) and LOG2_NUM_EXPERTS = 10
++// (num_experts_per_node + 1 < 1024) to keep the instantiation count to one per top-k value per
++// runner type.  Everything else falls back to the two separate launches.
++// G2-2: the maximum number of 8-element chunks one thread stages per row.  hidden_size /
++// (8 * BLOCK_SIZE) must be <= this; the host gate refuses the fusion otherwise.
++constexpr int G2_EXPAND_MAX_CHUNKS = 16;
++// RQ2: chunks per trip of the expand quantize loop (a build-time choice; FC_fc-moe 1d).
++#ifndef G2_EXPAND_QUANT_UNROLL
++#define G2_EXPAND_QUANT_UNROLL 2
++#endif
++// RQ2h: 1 = compute the row's SF write address once instead of once per chunk (FC_fc-moe 1d).
++#ifndef G2_EXPAND_SF_HOIST
++#define G2_EXPAND_SF_HOIST 0
++#endif
++
++// RQ2: one 16-byte global -> shared copy that holds no registers while in flight (cached in L2
++// only), and the wait for all of this thread's copies.
++__device__ __forceinline__ void g2CpAsync16(void* smem_dst, void const* gmem_src) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++  uint32_t const dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
++  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(gmem_src) : "memory");
++#else
++  *static_cast<uint4*>(smem_dst) = *static_cast<uint4 const*>(gmem_src);
++#endif
++}
++
++__device__ __forceinline__ void g2CpAsyncWaitAll() {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++  asm volatile("cp.async.wait_all;\n" ::: "memory");
++#endif
++}
++
++// Keep the length on device (including during CUDA graph replay).  Widen before adding
++// the mandatory verifier row, so even INT32_MAX is safe.
++__device__ __forceinline__ int64_t moeVtActiveRows(int64_t num_tokens, int const* vt_lens,
++                                                int vt_batch_size) {
++  if (vt_lens == nullptr) return num_tokens;
++  int64_t const rows_per_request = num_tokens / vt_batch_size;
++  int64_t active_rows = 0;
++  for (int request = 0; request < vt_batch_size; ++request) {
++    int64_t const len = vt_lens[request];
++    int64_t const rows = (len > 0 ? len : 0) + 1;
++    active_rows += rows < rows_per_request ? rows : rows_per_request;
++  }
++  return active_rows;
++}
++
++__device__ __forceinline__ bool moeVtIsActiveRow(int64_t row, int64_t num_tokens,
++                                               int const* vt_lens, int vt_batch_size) {
++  if (row < 0 || row >= num_tokens) return false;
++  if (vt_lens == nullptr) return true;
++  int64_t const rows_per_request = num_tokens / vt_batch_size;
++  int64_t const len = vt_lens[row / rows_per_request];
++  int64_t const rows = (len > 0 ? len : 0) + 1;
++  return row % rows_per_request < rows;
++}
++
++// The legacy routing kernels accept id -1, but cannot consume a device row count.
++// If A3 declines with pruning off, only the per-request tail mask needs a standalone launch.
++__global__ void maskMoeVtTailKernel(int* ids, float* scales, int64_t num_tokens,
++                                   int experts_per_token, int const* vt_lens, int vt_batch_size) {
++  int64_t const routes = num_tokens * experts_per_token;
++  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++       i < routes; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
++    if (!moeVtIsActiveRow(i / experts_per_token, num_tokens, vt_lens, vt_batch_size)) {
++      ids[i] = -1;
++      scales[i] = 0.f;
++    }
++  }
++}
++
++// VT fallback: stage decisions without modifying the source ids/weights.  This keeps
++// singleton counts strictly pre-prune across CTAs.  The otherwise-unused permutation-id
++// workspace supplies one int per route; no allocation or host length read is needed.
++__global__ void prepareMoeVtPruneKernel(
++    int const* ids, float const* scales, int* prepared_ids, int64_t num_tokens,
++    int experts_per_token, int num_experts, int const* vt_lens, int vt_batch_size, float tau,
++    int min_rank, int min_rows, int max_rows) {
++  int64_t const active_rows = moeVtActiveRows(num_tokens, vt_lens, vt_batch_size);
++  bool const prune = tau > 0.f && min_rank < experts_per_token &&
++                     active_rows >= min_rows && active_rows <= max_rows;
++  int64_t const routes = num_tokens * experts_per_token;
++  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++       i < routes; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
++    int64_t const row = i / experts_per_token;
++    if (!moeVtIsActiveRow(row, num_tokens, vt_lens, vt_batch_size)) {
++      prepared_ids[i] = -1;
++      continue;
++    }
++    int const expert = ids[i];
++    bool drop = false;
++    if (prune && expert >= 0 && expert < num_experts && scales[i] < tau) {
++      int const slot = i % experts_per_token;
++      int rank = 0;
++      float const weight = scales[i];
++      for (int j = 0; j < experts_per_token; ++j) {
++        float const other = scales[row * experts_per_token + j];
++        rank += (other > weight || (other == weight && j < slot)) ? 1 : 0;
++      }
++      if (rank >= min_rank) {
++        int count = 0;
++        for (int64_t j = 0; j < routes && count < 2; ++j) {
++          if (moeVtIsActiveRow(j / experts_per_token, num_tokens, vt_lens, vt_batch_size) &&
++              ids[j] == expert) {
++            ++count;
++          }
++        }
++        drop = count == 1;
++      }
++    }
++    prepared_ids[i] = drop ? -1 : expert;
++  }
++}
++
++__global__ void applyMoeVtPruneKernel(int* ids, float* scales, int const* prepared_ids,
++                                     int64_t routes) {
++  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++       i < routes; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
++    int const expert = prepared_ids[i];
++    ids[i] = expert;
++    if (expert == -1) scales[i] = 0.f;
++  }
++}
++
++template <class T, class WeightType, class OutputType, class ScaleBiasType, class InputAct,
++          int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS, bool FUSE_EXPAND>
++__global__ void fusedBuildExpertMapsSortFirstTokenAndStridesKernel(
++    int const* const token_selected_experts, int* const permuted_row_to_unpermuted_row,
++    int* const unpermuted_row_to_permuted_row, int64_t* const expert_first_token_offset,
++    int64_t const num_tokens, int const start_expert, int const end_expert,
++    int const num_experts_per_node, TmaWarpSpecializedGroupedGemmInput layout_info1,
++    TmaWarpSpecializedGroupedGemmInput layout_info2, int64_t gemm1_n, int64_t gemm1_k,
++    int64_t gemm2_n, int64_t gemm2_k, T const* gemm1_in, T const* gemm2_in,
++    WeightType const* weights1, WeightType const* weights2, float const* alpha_scale_flat1,
++    float const* alpha_scale_flat2,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
++    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
++    OutputType* gemm2_output, float const* router_scales, G1PackParams g1, int stride_blocks,
++    InputAct const* expand_input, T* expand_output, float const* expand_unpermuted_scales,
++    float* expand_permuted_scales,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF* expand_act_sf_flat,
++    float const* expand_act_global_scale, bool expand_use_per_expert_act_scale,
++    int64_t expand_hidden_size, float prune_tau, int prune_min_rank, float const* prune_scales,
++    int* prune_ids_out, float* prune_scales_out, int const* vt_lens,
++    int prune_min_rows, int prune_max_rows, int vt_batch_size, int const* oea_k0,
++    double* oea_stats) {
++  using BlockRadixRank = FusedPrologueRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS>;
++  static_assert(BlockRadixRank::BINS_TRACKED_PER_THREAD * BLOCK_SIZE >= (1 << LOG2_NUM_EXPERTS));
++  static_assert(EXPERTS_PER_TOKEN <= 32, "P2 keeps the prune mask in one 32-bit word");
++  assert(num_experts_per_node < (1 << LOG2_NUM_EXPERTS));
++  assert(num_experts_per_node == (end_expert - start_expert));
++
++  extern __shared__ unsigned char temp_storage[];
++  auto& sort_temp = *reinterpret_cast<typename BlockRadixRank::TempStorage*>(temp_storage);
++  int* const shared_offsets =
++      reinterpret_cast<int*>(temp_storage + sizeof(typename BlockRadixRank::TempStorage));
++  // G2-2: the inverse permutation and the per-permuted-row expert id, published block-locally so
++  // the row expansion below needs neither a global round trip nor the binary search that
++  // expandInputRowsKernel pays.  Every block re-runs the rank, so no grid-wide barrier is needed.
++  int* const shared_inv_row = shared_offsets + (num_experts_per_node + 1);
++  int* const shared_inv_expert = shared_inv_row + BLOCK_SIZE * EXPERTS_PER_TOKEN;
++
++  int const token = threadIdx.x;
++  bool const is_valid_token = token < num_tokens;
++
++  int local_token_selected_experts[EXPERTS_PER_TOKEN];
++  int local_token_permuted_indices[EXPERTS_PER_TOKEN];
++
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  cudaGridDependencySynchronize();
++#endif
++
++  int64_t const active_rows = moeVtActiveRows(num_tokens, vt_lens, vt_batch_size);
++  bool const is_active_token = moeVtIsActiveRow(token, num_tokens, vt_lens, vt_batch_size);
++
++#pragma unroll
++  for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++    int const expert = is_active_token ? token_selected_experts[token * EXPERTS_PER_TOKEN + i]
++                                      : num_experts_per_node;
++    bool is_valid_expert = is_active_token && expert >= start_expert && expert < end_expert;
++    local_token_selected_experts[i] = !is_valid_token   ? num_experts_per_node + 1
++                                      : is_valid_expert ? (expert - start_expert)
++                                                        : num_experts_per_node;
++  }
++
++  // ---- P2: singleton-route prune, applied to the keys *before* the rank ------------------
++  // A route is dropped when, within this call, it is the only route to its expert (pre-prune
++  // count == 1, from a block-local histogram), its routing weight is < prune_tau, and its
++  // within-row rank (routes of the same row with a larger weight, ties broken by slot index --
++  // the same rule as SGLang's P1 Triton kernel) is >= prune_min_rank.  Dropping means re-keying
++  // it to `num_experts_per_node`, the "not on this node" bucket, which the radix rank sorts past
++  // every real expert: the permutation, the expert offsets, the G1 packing and the G2-2 row
++  // expansion below then all see the pruned set with no further change.  The histogram borrows
++  // `shared_offsets`, which is dead until after RankKeys.  prune_tau <= 0 skips all of it.
++  unsigned prune_mask = 0u;
++  if (prune_tau > 0.f && active_rows >= prune_min_rows && active_rows <= prune_max_rows) {
++    float local_w[EXPERTS_PER_TOKEN];
++#pragma unroll
++    for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++      local_w[i] = is_active_token ? prune_scales[token * EXPERTS_PER_TOKEN + i] : 0.f;
++    }
++    // oea-sd: oea_k0 = {k0, min_rows}.  OEA runs only when at least min_rows rows take part:
++    // the VT live rows 0..L when vt_lens is set, every row otherwise (active_rows == num_tokens).
++    int const k0 = oea_k0 ? oea_k0[0] : 0;
++    int const oea_min_rows = oea_k0 ? oea_k0[1] : 0;
++    bool const oea_applied =
++        k0 > 0 && k0 < EXPERTS_PER_TOKEN && active_rows >= static_cast<int64_t>(oea_min_rows);
++    unsigned valid_mask = 0u;
++#pragma unroll
++    for (int i = 0; i < EXPERTS_PER_TOKEN; ++i) {
++      if (local_token_selected_experts[i] < num_experts_per_node) valid_mask |= 1u << i;
++    }
++    if (oea_applied) {
++      for (int e = threadIdx.x; e < num_experts_per_node; e += BLOCK_SIZE) shared_offsets[e] = 0;
++      __syncthreads();
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; ++i) {
++        if (valid_mask & (1u << i)) {
++          int rank = 0;
++#pragma unroll
++          for (int j = 0; j < EXPERTS_PER_TOKEN; ++j) {
++            rank += (valid_mask & (1u << j)) &&
++                    (local_w[j] > local_w[i] || (local_w[j] == local_w[i] && j < i));
++          }
++          if (rank < k0) atomicExch(&shared_offsets[local_token_selected_experts[i]], 1);
++        }
++      }
++      __syncthreads();
++      // Write-back cannot change U: dropped routes are never base and every base route
++      // in the same row outranks them. Their -1 ids or zero weights leave base ranks and keys unchanged.
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; ++i) {
++        int const key = local_token_selected_experts[i];
++        if (key < num_experts_per_node && shared_offsets[key] == 0) {
++          prune_mask |= 1u << i;
++          local_token_selected_experts[i] = num_experts_per_node;
++        }
++      }
++      __syncthreads();
++    } else {
++      for (int e = threadIdx.x; e < num_experts_per_node; e += BLOCK_SIZE) {
++        shared_offsets[e] = 0;
++      }
++      __syncthreads();
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++        if (local_token_selected_experts[i] < num_experts_per_node) {
++          atomicAdd(&shared_offsets[local_token_selected_experts[i]], 1);
++        }
++      }
++      __syncthreads();
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++        int const key = local_token_selected_experts[i];
++        if (key < num_experts_per_node) {
++          int rank = 0;
++#pragma unroll
++          for (int j = 0; j < EXPERTS_PER_TOKEN; j++) {
++            rank += (local_w[j] > local_w[i] || (local_w[j] == local_w[i] && j < i)) ? 1 : 0;
++          }
++          if (shared_offsets[key] == 1 && local_w[i] < prune_tau && rank >= prune_min_rank) {
++            prune_mask |= 1u << i;
++            local_token_selected_experts[i] = num_experts_per_node;
++          }
++        }
++      }
++    }
++    __syncthreads();
++    if (oea_stats != nullptr && blockIdx.x == 0) {
++      for (int e = threadIdx.x; e < num_experts_per_node; e += BLOCK_SIZE) shared_offsets[e] = 0;
++      __syncthreads();
++      float total = 0.f, kept_mass = 0.f;
++      int valid_count = 0, kept_count = 0;
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; ++i) {
++        if (valid_mask & (1u << i)) {
++          int const expert = token_selected_experts[token * EXPERTS_PER_TOKEN + i] - start_expert;
++          bool const kept = !(prune_mask & (1u << i));
++          atomicOr(&shared_offsets[expert], kept ? 3 : 1);
++          ++valid_count;
++          total += local_w[i];
++          if (kept) { ++kept_count; kept_mass += local_w[i]; }
++        }
++      }
++      __syncthreads();
++      int before = 0, after = 0;
++      for (int e = threadIdx.x; e < num_experts_per_node; e += BLOCK_SIZE) {
++        before += shared_offsets[e] != 0;
++        after += (shared_offsets[e] & 2) != 0;
++      }
++      atomicAdd(oea_stats + 2, double(valid_count));
++      atomicAdd(oea_stats + 3, double(kept_count));
++      atomicAdd(oea_stats + 4, double(before));
++      atomicAdd(oea_stats + 5, double(after));
++      atomicAdd(oea_stats + 6, double(total > 0.f ? (total - kept_mass) / total : 0.f));
++      if (threadIdx.x == 0) {
++        atomicAdd(oea_stats, 1.0);
++        atomicAdd(oea_stats + 1, double(active_rows));  // oea-sd: live rows (== num_tokens without VT)
++        atomicAdd(oea_stats + 7, oea_applied ? 1.0 : 0.0);
++      }
++    }
++    __syncthreads();  // every histogram read precedes the shared_offsets writes below
++  }
++
++  int local_expert_first_token_offset[BlockRadixRank::BINS_TRACKED_PER_THREAD];
++  cub::BFEDigitExtractor<int> extractor(0, LOG2_NUM_EXPERTS);
++  BlockRadixRank(sort_temp).RankKeys(local_token_selected_experts, local_token_permuted_indices,
++                                     extractor, local_expert_first_token_offset);
++
++  bool const writer_block = (blockIdx.x == 0);
++  if (writer_block && is_valid_token) {
++#pragma unroll
++    for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++      int const unpermuted_row = i * num_tokens + token;
++      int const permuted_row = local_token_permuted_indices[i];
++      permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
++      unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
++    }
++    // P2: publish the dropped routes as id -1 / weight 0 (P1's convention) so the unfused
++    // finalize kernels skip them.  Other blocks of this grid re-read these tensors for their own
++    // copy of the rank; a block that observes the written state derives the same keys (a -1 id
++    // maps straight to the not-on-node bucket, and a zeroed weight only lowers the ranks of
++    // routes that were dropped anyway), so the order of these writes against those reads does
++    // not matter.
++    bool const is_tail = vt_lens != nullptr && !is_active_token;
++    if (is_tail || prune_mask != 0u) {
++#pragma unroll
++      for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++        if (is_tail || (prune_mask & (1u << i))) {
++          prune_ids_out[token * EXPERTS_PER_TOKEN + i] = -1;
++          prune_scales_out[token * EXPERTS_PER_TOKEN + i] = 0.f;
++        }
++      }
++    }
++  }
++
++#pragma unroll
++  for (int expert_id = 0; expert_id < BlockRadixRank::BINS_TRACKED_PER_THREAD; expert_id++) {
++    int out_expert_id = expert_id + token * BlockRadixRank::BINS_TRACKED_PER_THREAD;
++    if (out_expert_id < num_experts_per_node + 1) {
++      shared_offsets[out_expert_id] = local_expert_first_token_offset[expert_id];
++      if (writer_block) {
++        expert_first_token_offset[out_expert_id] = local_expert_first_token_offset[expert_id];
++      }
++    }
++  }
++
++  if constexpr (FUSE_EXPAND) {
++    // RankKeys gives BLOCK_SIZE * EXPERTS_PER_TOKEN distinct ranks, so these writes never collide
++    // (invalid tokens rank past num_valid_rows and are simply never read back).
++#pragma unroll
++    for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
++      int const permuted_row = local_token_permuted_indices[i];
++      shared_inv_row[permuted_row] = i * static_cast<int>(num_tokens) + token;
++      shared_inv_expert[permuted_row] = local_token_selected_experts[i];
++    }
++  }
++  __syncthreads();
++
++  int const expert = blockIdx.x * BLOCK_SIZE + threadIdx.x;
++  // ---- G1: pack the active experts into the front of the group list ----------------------
++  // Confined to the descriptor blocks, which are exactly the blocks whose `expert` covers
++  // [0, num_experts_per_node) once -- the G2-2 row blocks are disjoint and untouched.  Every
++  // descriptor block already holds the whole `shared_offsets` array (the A3 design re-runs the
++  // rank in every block), so `rank(e)` and `D` need no grid-wide communication.
++  if (blockIdx.x < static_cast<unsigned>(stride_blocks)) {
++    int out_idx1 = expert;
++    int out_idx2 = expert;
++    if (g1.pack_groups) {
++      int const lane = threadIdx.x;  // BLOCK_SIZE == 32: one warp, all lanes live here
++      int const block_base = static_cast<int>(blockIdx.x) * BLOCK_SIZE;
++      int cnt_all = 0, cnt_before = 0;
++      for (int e = lane; e < num_experts_per_node; e += BLOCK_SIZE) {
++        int const a = (shared_offsets[e + 1] > shared_offsets[e]) ? 1 : 0;
++        cnt_all += a;
++        cnt_before += (e < block_base) ? a : 0;
++      }
++#pragma unroll
++      for (int off = BLOCK_SIZE / 2; off > 0; off >>= 1) {
++        cnt_all += __shfl_xor_sync(0xffffffff, cnt_all, off);
++        cnt_before += __shfl_xor_sync(0xffffffff, cnt_before, off);
++      }
++      int const d_active = cnt_all;
++      bool const is_active =
++          (expert < num_experts_per_node) && (shared_offsets[expert + 1] > shared_offsets[expert]);
++      unsigned const active_mask = __ballot_sync(0xffffffff, is_active ? 1 : 0);
++      int const rank = cnt_before + __popc(active_mask & ((1u << lane) - 1u));
++      out_idx1 = rank;
++      out_idx2 = rank;
++      // Thread `expert` owns leftover group index `expert`.  Ranks are all < d_active, so any
++      // slot >= d_active is unclaimed and is emptied here exactly once -- including by threads
++      // whose own expert is active but sits at a high index (they write their descriptor at
++      // `rank < d_active`, a different slot).
++      if (expert >= d_active) {
++        if (expert < g1.num_groups_gemm1) {
++          writeEmptyProblemShape(layout_info1, expert, gemm1_n, gemm1_k);
++        }
++        if (expert < g1.num_groups_gemm2) {
++          writeEmptyProblemShape(layout_info2, expert, gemm2_n, gemm2_k);
++        }
++      }
++      if (expert < num_experts_per_node && is_active) {
++        computeStridesTmaWarpSpecializedForExpert<T, WeightType, OutputType, ScaleBiasType>(
++            expert, shared_offsets[expert], shared_offsets[expert + 1], layout_info1, layout_info2,
++            gemm1_n, gemm1_k, gemm2_n, gemm2_k, gemm1_in, gemm2_in, weights1, weights2,
++            alpha_scale_flat1, alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2, quant_params,
++            bias1, bias2, gemm1_output, gemm2_output, router_scales, permuted_row_to_unpermuted_row,
++            out_idx1, out_idx2);
++      }
++    } else if (expert < num_experts_per_node) {
++      computeStridesTmaWarpSpecializedForExpert<T, WeightType, OutputType, ScaleBiasType>(
++          expert, shared_offsets[expert], shared_offsets[expert + 1], layout_info1, layout_info2,
++          gemm1_n, gemm1_k, gemm2_n, gemm2_k, gemm1_in, gemm2_in, weights1, weights2,
++          alpha_scale_flat1, alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2, quant_params, bias1,
++          bias2, gemm1_output, gemm2_output, router_scales, permuted_row_to_unpermuted_row);
++    }
++  }
++
++#ifdef ENABLE_FP4
++  if constexpr (FUSE_EXPAND && std::is_same_v<T, __nv_fp4_e2m1> &&
++                (std::is_same_v<InputAct, __nv_bfloat16> || std::is_same_v<InputAct, half>)) {
++    // ---- G2-2: expandInputRowsKernel, folded in -------------------------------------------
++    // Blocks [stride_blocks, gridDim.x) own the rows; the descriptor blocks above are disjoint,
++    // so the two phases run concurrently instead of one launch after the other.
++    constexpr int64_t ELEM_PER_THREAD = CVT_ELTS_PER_THREAD;  // 8
++    constexpr int VecSize = TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
++    constexpr int64_t min_k_dim_alignment =
++        TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4;
++    using DataElem = cutlass::Array<InputAct, ELEM_PER_THREAD>;
++    using OutputElem = uint32_t;
++
++    int const row_slot = static_cast<int>(blockIdx.x) - stride_blocks;
++    int const row_blocks = static_cast<int>(gridDim.x) - stride_blocks;
++    if (row_slot >= 0 && row_blocks > 0) {
++      int64_t const padded_hidden_size =
++          TmaWarpSpecializedGroupedGemmInput::alignToSfDim(expand_hidden_size, min_k_dim_alignment);
++      int64_t const num_elems_in_col = expand_hidden_size / ELEM_PER_THREAD;
++      int const trips = static_cast<int>(num_elems_in_col) / BLOCK_SIZE;  // exact, host-gated
++      int64_t const num_valid_rows = shared_offsets[num_experts_per_node];
++
++      for (int64_t permuted_row = row_slot; permuted_row < num_valid_rows;
++           permuted_row += row_blocks) {
++        int const unpermuted_row = shared_inv_row[permuted_row];
++        int const row_expert = shared_inv_expert[permuted_row];
++        int64_t const num_tokens_before_expert = shared_offsets[row_expert];
++        float const global_scale_val =
++            expand_act_global_scale
++                ? expand_act_global_scale[expand_use_per_expert_act_scale ? row_expert : 0]
++                : 1.0f;
++        int64_t const source_row = unpermuted_row % num_tokens;
++        int64_t const source_k_rank = unpermuted_row / num_tokens;
++
++        auto const* source_row_ptr =
++            reinterpret_cast<DataElem const*>(expand_input + source_row * expand_hidden_size);
++        auto* dest_row_ptr = reinterpret_cast<OutputElem*>(expand_output) +
++                             permuted_row * num_elems_in_col;
++
++        // RQ2: stage the whole row in shared memory with cp.async. With one warp per row the loads
++        // must all be in flight at once, or the 10 dependent round trips cost more than the launch
++        // we deleted; cp.async does that without holding registers, so the quantize loop below can
++        // stay compact. Unrolled, that loop is ~20 KB of straight-line SASS whose instruction lines
++        // miss L2 after weight streaming (+3.8 us per call, FC_fc-moe 4b.1c).
++        __shared__ __align__(16) uint4 g2_stage[G2_EXPAND_MAX_CHUNKS * BLOCK_SIZE];
++        auto const* source_row_u4 = reinterpret_cast<uint4 const*>(source_row_ptr);
++#pragma unroll
++        for (int chunk = 0; chunk < G2_EXPAND_MAX_CHUNKS; chunk++) {
++          if (chunk < trips) {
++            g2CpAsync16(&g2_stage[threadIdx.x + chunk * BLOCK_SIZE],
++                        source_row_u4 + threadIdx.x + chunk * BLOCK_SIZE);
++          }
++        }
++        g2CpAsyncWaitAll();  // each thread reads back only its own slots
++#if G2_EXPAND_SF_HOIST
++        // quantizePackedFPXValue finds the SF byte inside an even-lanes-only branch, so every
++        // chunk carries a divergent branch the next chunk cannot be scheduled across. In the
++        // SWIZZLED_128x4 layout a chunk (32 lanes x 8 elements = 16 SF vectors) covers exactly 4
++        // K tiles of [32][4][4] = 512 bytes, so the byte moves by a constant per chunk and only
++        // the first one needs the full formula (same result as cvt_quant_get_sf_out_offset).
++        constexpr int SF_LANES = VecSize / ELEM_PER_THREAD;    // lanes per SF byte (2)
++        constexpr int SF_PER_CHUNK = BLOCK_SIZE / SF_LANES;   // 16
++        static_assert(VecSize % ELEM_PER_THREAD == 0 && SF_PER_CHUNK % 4 == 0,
++                      "a chunk must cover whole 128x4 K tiles");
++        constexpr int64_t SF_CHUNK_STRIDE = SF_PER_CHUNK / 4 * 512;  // 2048
++        uint8_t* const sf_row =
++            threadIdx.x % SF_LANES == 0
++                ? reinterpret_cast<uint8_t*>(
++                      expand_act_sf_flat +
++                      getOffsetActivationSF(
++                          row_expert, num_tokens_before_expert, padded_hidden_size,
++                          TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4)) +
++                      static_cast<uint32_t>(get_sf_out_offset_128x4(
++                          static_cast<int>(permuted_row - num_tokens_before_expert),
++                          static_cast<int>(threadIdx.x) / SF_LANES,
++                          static_cast<int>(padded_hidden_size / VecSize)))
++                : nullptr;
++#endif
++#pragma unroll 1
++        for (int chunk0 = 0; chunk0 < trips; chunk0 += G2_EXPAND_QUANT_UNROLL) {
++#pragma unroll
++          for (int u = 0; u < G2_EXPAND_QUANT_UNROLL; u++) {
++            // An odd tail repeats the last chunk (the same bytes to the same places) instead of
++            // branching around the second body, so the bodies can interleave.
++            int const chunk = min(chunk0 + u, trips - 1);
++            int64_t const elem_index = threadIdx.x + chunk * BLOCK_SIZE;
++            DataElem staged;
++            *reinterpret_cast<uint4*>(&staged) = g2_stage[elem_index];
++#if G2_EXPAND_SF_HOIST
++            // quantizePackedFPXValue's NVFP4 path with the SF address from sf_row.
++            PackedVec<InputAct> packed_vec{};
++            for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
++              packed_vec.elts[i].x = static_cast<InputAct>(staged[i * 2 + 0]);
++              packed_vec.elts[i].y = static_cast<InputAct>(staged[i * 2 + 1]);
++            }
++            auto res = cvt_warp_fp16_to_fp4<InputAct, VecSize, CVT_ELTS_PER_THREAD, false, false,
++                                            std::false_type>(
++                packed_vec, global_scale_val,
++                sf_row ? sf_row + SF_CHUNK_STRIDE * chunk : nullptr, 0.0f);
++#else
++            auto res = quantizePackedFPXValue<InputAct, T, DataElem, VecSize, false,
++                                              std::false_type>(
++                staged, global_scale_val, num_tokens_before_expert, row_expert, permuted_row,
++                elem_index, padded_hidden_size, expand_act_sf_flat,
++                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
++#endif
++            static_assert(sizeof(res) == sizeof(*dest_row_ptr),
++                          "Quantized value must be the same size as the output");
++            dest_row_ptr[elem_index] = res;
++          }
++        }
++
++        // K-dim SF padding, exactly as expandInputRowsKernel does it (a no-op when
++        // hidden_size % 64 == 0).
++        for (int64_t elem_index = expand_hidden_size / VecSize + threadIdx.x;
++             elem_index < padded_hidden_size / VecSize; elem_index += BLOCK_SIZE) {
++          writeSF<VecSize, VecSize>(num_tokens_before_expert, row_expert, /*source_row*/ -1,
++                                    permuted_row, elem_index, padded_hidden_size,
++                                    expand_act_sf_flat, /*input_sf*/ nullptr);
++        }
++
++        if (expand_permuted_scales && threadIdx.x == 0) {
++          int64_t const source_k_idx = source_row * EXPERTS_PER_TOKEN + source_k_rank;
++          expand_permuted_scales[permuted_row] =
++              expand_unpermuted_scales ? expand_unpermuted_scales[source_k_idx] : 1.0f;
++        }
++      }
++    }
++  }
++#endif
++
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   cudaTriggerProgrammaticLaunchCompletion();
+ #endif
+ }
+ 
++// G2-1: FLASHINFER_MOE_FOLD_MEMSET=0 keeps the fused-finalize output zeroing as its own
++// cudaMemsetAsync launch instead of folding it into doActivationKernel's grid.
++inline bool foldMemsetEnabled() {
++  static bool const enabled = [] {
++    char const* v = std::getenv("FLASHINFER_MOE_FOLD_MEMSET");
++    return !(v && v[0] == '0' && v[1] == '\0');
++  }();
++  return enabled;
++}
++
++// G2-2: FLASHINFER_MOE_FOLD_EXPAND=0 keeps expandInputRowsKernel as its own launch.
++inline bool foldExpandEnabled() {
++  static bool const enabled = [] {
++    char const* v = std::getenv("FLASHINFER_MOE_FOLD_EXPAND");
++    return !(v && v[0] == '0' && v[1] == '\0');
++  }();
++  return enabled;
++}
++
++// P2: FLASHINFER_MOE_PRUNE_SINGLETON_TAU=<float> folds singleton-route pruning into the fused
++// routing prologue (see fusedBuildExpertMapsSortFirstTokenAndStridesKernel).  Unset / 0 = off,
++// upstream path byte-identical.  The three companions mirror SGLang's P1 knobs: MIN_RANK is the
++// lowest 0-based within-row rank eligible (>= 1, a row must keep its top-1), MIN_ROWS/MAX_ROWS
++// bound the batch sizes touched (default 2..64; the fused prologue itself stops at 32).
++struct MoePruneConfig {
++  float tau = 0.f;
++  int min_rank = 1;
++  int min_rows = 2;
++  int max_rows = 64;
++};
++inline MoePruneConfig const& moePruneConfig() {
++  static MoePruneConfig const cfg = [] {
++    MoePruneConfig c{};
++    if (char const* s = std::getenv("FLASHINFER_MOE_PRUNE_SINGLETON_TAU")) c.tau = std::atof(s);
++    if (char const* s = std::getenv("FLASHINFER_MOE_PRUNE_MIN_RANK")) c.min_rank = std::atoi(s);
++    if (char const* s = std::getenv("FLASHINFER_MOE_PRUNE_MIN_ROWS")) c.min_rows = std::atoi(s);
++    if (char const* s = std::getenv("FLASHINFER_MOE_PRUNE_MAX_ROWS")) c.max_rows = std::atoi(s);
++    if (!(c.tau > 0.f)) c.tau = 0.f;
++    if (c.min_rank < 1) c.min_rank = 1;
++    return c;
++  }();
++  return cfg;
++}
++
++// FLASHINFER_MOE_FUSED_STRIDES=0 keeps computeStridesTmaWarpSpecialized as its own launch.
++inline bool fusedStridesEnabled() {
++  static bool const enabled = [] {
++    char const* v = std::getenv("FLASHINFER_MOE_FUSED_STRIDES");
++    return !(v && v[0] == '0' && v[1] == '\0');
++  }();
++  return enabled;
++}
++
++template <class T, class WeightType, class OutputType, class ScaleBiasType, class InputAct,
++          int EXPERTS_PER_TOKEN, bool FUSE_EXPAND>
++bool launchFusedPrologueAndStrides(
++    FusedPrologueRequest& req, TmaWarpSpecializedGroupedGemmInput layout_info1,
++    TmaWarpSpecializedGroupedGemmInput layout_info2, int const num_experts_per_node,
++    int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k, T const* gemm1_in,
++    T const* gemm2_in, WeightType const* weights1, WeightType const* weights2,
++    float const* alpha_scale_flat1, float const* alpha_scale_flat2,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
++    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
++    OutputType* gemm2_output, float const* router_scales, bool enable_pdl, cudaStream_t stream) {
++  constexpr int BLOCK_SIZE = 32;
++  constexpr int LOG2_NUM_EXPERTS = 10;
++  using BlockRadixRank = FusedPrologueRadixRank<BLOCK_SIZE, LOG2_NUM_EXPERTS>;
++
++  size_t const shared_size =
++      sizeof(typename BlockRadixRank::TempStorage) +
++      sizeof(int) * static_cast<size_t>(num_experts_per_node + 1) +
++      (FUSE_EXPAND ? 2 * sizeof(int) * size_t(BLOCK_SIZE) * size_t(EXPERTS_PER_TOKEN) : 0);
++
++  int device = 0;
++  int max_smem_per_block = 0;
++  check_cuda_error(cudaGetDevice(&device));
++  check_cuda_error(
++      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
++  if (shared_size >= static_cast<size_t>(max_smem_per_block)) {
++    return false;
++  }
++
++  auto kernel = &fusedBuildExpertMapsSortFirstTokenAndStridesKernel<
++      T, WeightType, OutputType, ScaleBiasType, InputAct, BLOCK_SIZE, EXPERTS_PER_TOKEN,
++      LOG2_NUM_EXPERTS, FUSE_EXPAND>;
++  check_cuda_error(
++      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_size));
++
++  int const stride_blocks = (num_experts_per_node + BLOCK_SIZE - 1) / BLOCK_SIZE;
++  int const row_blocks =
++      FUSE_EXPAND ? static_cast<int>(req.num_tokens * req.experts_per_token) : 0;
++
++  cudaLaunchConfig_t config;
++  config.gridDim = stride_blocks + row_blocks;
++  config.blockDim = BLOCK_SIZE;
++  config.dynamicSmemBytes = shared_size;
++  config.stream = stream;
++  cudaLaunchAttribute attrs[1];
++  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
++  config.numAttrs = 1;
++  config.attrs = attrs;
++
++  check_cuda_error(cudaLaunchKernelEx(
++      &config, kernel, req.token_selected_experts, req.permuted_row_to_unpermuted_row,
++      req.unpermuted_row_to_permuted_row, req.expert_first_token_offset, req.num_tokens,
++      req.start_expert, req.end_expert, num_experts_per_node, layout_info1, layout_info2, gemm1_n,
++      gemm1_k, gemm2_n, gemm2_k, gemm1_in, gemm2_in, weights1, weights2, alpha_scale_flat1,
++      alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2, quant_params, bias1, bias2, gemm1_output,
++      gemm2_output, router_scales, req.g1, stride_blocks,
++      reinterpret_cast<InputAct const*>(req.expand_input), reinterpret_cast<T*>(req.expand_output),
++      req.expand_unpermuted_scales, req.expand_permuted_scales, req.expand_act_sf_flat,
++      req.expand_act_global_scale, req.expand_use_per_expert_act_scale, req.expand_hidden_size,
++      req.prune_tau, req.prune_min_rank, req.prune_scales, req.prune_ids_out,
++      req.prune_scales_out, req.vt_lens, req.prune_min_rows, req.prune_max_rows,
++      req.vt_batch_size, req.oea_k0, req.oea_stats));
++  req.prune_fused = req.prune_tau > 0.f;
++  return true;
++}
++
++template <class T, class WeightType, class OutputType, class ScaleBiasType, class InputAct>
++bool tryFusedPrologueAndStrides(
++    FusedPrologueRequest& req, TmaWarpSpecializedGroupedGemmInput const& layout_info1,
++    TmaWarpSpecializedGroupedGemmInput const& layout_info2, int const num_experts_per_node,
++    int64_t gemm1_n, int64_t gemm1_k, int64_t gemm2_n, int64_t gemm2_k, T const* gemm1_in,
++    T const* gemm2_in, WeightType const* weights1, WeightType const* weights2,
++    float const* alpha_scale_flat1, float const* alpha_scale_flat2,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
++    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
++    ScaleBiasType const* bias1, ScaleBiasType const* bias2, OutputType* gemm1_output,
++    OutputType* gemm2_output, float const* router_scales, bool enable_pdl, cudaStream_t stream) {
++  if (!fusedPrologueEnabled() || !fusedStridesEnabled()) {
++    return false;
++  }
++  if (req.num_tokens > 32 || num_experts_per_node + 1 >= 1024 ||
++      num_experts_per_node != (req.end_expert - req.start_expert)) {
++    return false;
++  }
++
++  // G2-2 gate.  Everything not covered here keeps the standalone expandInputRowsKernel launch.
++  constexpr int BLOCK_SIZE = 32;
++  bool fuse_expand = req.expand_requested && foldExpandEnabled();
++#ifdef ENABLE_FP4
++  if (fuse_expand) {
++    constexpr bool kTypesOk =
++        std::is_same_v<T, __nv_fp4_e2m1> &&
++        (std::is_same_v<InputAct, __nv_bfloat16> || std::is_same_v<InputAct, half>);
++    int64_t const elems_per_row = req.expand_hidden_size / CVT_ELTS_PER_THREAD;
++    fuse_expand =
++        kTypesOk && req.expand_input != nullptr && req.expand_output != nullptr &&
++        req.expand_act_sf_flat != nullptr && req.expand_hidden_size > 0 &&
++        req.expand_hidden_size % (CVT_ELTS_PER_THREAD * BLOCK_SIZE) == 0 &&
++        elems_per_row / BLOCK_SIZE <= G2_EXPAND_MAX_CHUNKS && req.num_tokens > 0 &&
++        req.experts_per_token > 0 &&
++        // the kernel hard-codes the default quantiser tags to keep one instantiation
++        !tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
++        !tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
++  }
++#else
++  fuse_expand = false;
++#endif
++  req.expand_fused = false;
++
++  auto go = [&](auto tag) {
++    if (fuse_expand) {
++      bool const ok = launchFusedPrologueAndStrides<T, WeightType, OutputType, ScaleBiasType,
++                                                    InputAct, decltype(tag)::value, true>(
++          req, layout_info1, layout_info2, num_experts_per_node, gemm1_n, gemm1_k, gemm2_n, gemm2_k,
++          gemm1_in, gemm2_in, weights1, weights2, alpha_scale_flat1, alpha_scale_flat2,
++          fp4_act_flat1, fp4_act_flat2, quant_params, bias1, bias2, gemm1_output, gemm2_output,
++          router_scales, enable_pdl, stream);
++      req.expand_fused = ok;
++      return ok;
++    }
++    return launchFusedPrologueAndStrides<T, WeightType, OutputType, ScaleBiasType, InputAct,
++                                         decltype(tag)::value, false>(
++        req, layout_info1, layout_info2, num_experts_per_node, gemm1_n, gemm1_k, gemm2_n, gemm2_k,
++        gemm1_in, gemm2_in, weights1, weights2, alpha_scale_flat1, alpha_scale_flat2, fp4_act_flat1,
++        fp4_act_flat2, quant_params, bias1, bias2, gemm1_output, gemm2_output, router_scales,
++        enable_pdl, stream);
++  };
++  switch (req.experts_per_token) {
++    case 1:
++      return go(std::integral_constant<int, 1>{});
++    case 2:
++      return go(std::integral_constant<int, 2>{});
++    case 4:
++      return go(std::integral_constant<int, 4>{});
++    case 6:
++      return go(std::integral_constant<int, 6>{});
++    case 8:
++      return go(std::integral_constant<int, 8>{});
++    case 10:
++      return go(std::integral_constant<int, 10>{});
++    default:
++      return false;
++  }
++}
++// ============================== end A3 =====================================================
++
+ // ========================== Permutation things =======================================
+ 
+ template <class T, class U>
+@@ -2145,7 +3040,7 @@
+     ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
+     int num_experts_per_node, int64_t inter_size, float const* fc2_act_global_scale,
+     bool use_per_expert_act_scale, TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
+-    ActivationParams activation_params) {
++    ActivationParams activation_params, void* fused_zero_ptr, int64_t fused_zero_vec16) {
+ #ifdef ENABLE_FP4
+   constexpr bool IsNVFP4 =
+       std::is_same_v<T, __nv_fp4_e2m1> &&
+@@ -2183,6 +3078,20 @@
+ 
+   int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+ 
++  // G2-1: fold the fused-finalize output zeroing (a 1.0 us memset32 launch in the serial MoE
++  // chain) into this kernel.  It is placed *before* cudaGridDependencySynchronize() because the
++  // zeroing depends on nothing GEMM1 produces; the stores are ordered ahead of GEMM2 by this
++  // kernel's cudaTriggerProgrammaticLaunchCompletion() below, exactly as the memset was.
++  if (fused_zero_ptr != nullptr) {
++    uint4* zero_out = reinterpret_cast<uint4*>(fused_zero_ptr);
++    uint4 const zero_val = make_uint4(0u, 0u, 0u, 0u);
++    int64_t const zero_tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    int64_t const zero_stride = int64_t(gridDim.x) * blockDim.x;
++    for (int64_t i = zero_tid; i < fused_zero_vec16; i += zero_stride) {
++      zero_out[i] = zero_val;
++    }
++  }
++
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   cudaGridDependencySynchronize();
+ #endif
+@@ -2322,7 +3231,8 @@
+                   int64_t inter_size, int64_t expanded_num_tokens, ActivationParams activation_type,
+                   QuantParams const& quant_params, bool use_per_expert_act_scale,
+                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, bool enable_pdl,
+-                  cudaStream_t stream) {
++                  cudaStream_t stream, void* fused_zero_ptr = nullptr,
++                  int64_t fused_zero_vec16 = 0) {
+   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
+   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
+@@ -2422,7 +3332,7 @@
+   cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
+                      expert_first_token_offset, num_experts_per_node, inter_size,
+                      quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale,
+-                     fc2_act_sf_flat, activation_type);
++                     fc2_act_sf_flat, activation_type, fused_zero_ptr, fused_zero_vec16);
+ }
+ 
+ // ============================== Lora Add Bias =================================
+@@ -3059,7 +3969,8 @@
+     int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
+     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
+     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++    void* fused_zero_ptr, int64_t fused_zero_vec16) {
+   if (fp8_blockscale_gemm_runner) {
+     TLLM_CHECK(!min_latency_mode);
+     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
+@@ -3144,7 +4055,7 @@
+         static_cast<UnfusedGemmOutputType const*>(gemm_output), fc2_fp8_quant, fc1_expert_biases,
+         bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
+         expanded_num_rows, fc1_activation_type, quant_params, use_per_expert_act_scale,
+-        fc2_fp4_act_flat, enable_pdl, stream);
++        fc2_fp4_act_flat, enable_pdl, stream, fused_zero_ptr, fused_zero_vec16);
+ 
+     sync_check_cuda_error(stream);
+   } else if (use_fp8) {
+@@ -3292,7 +4203,8 @@
+     int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
+     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
+     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++    bool finalize_output_prezeroed) {
+   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
+ 
+   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
+@@ -3324,8 +4236,11 @@
+       //
+       // This also means it is included in the timing for the profiler, which is probably more
+       // representative until we can overlap it
+-      check_cuda_error(cudaMemsetAsync(
+-          final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
++      // G2-1: skipped when doActivationKernel already zeroed this buffer in its own grid.
++      if (!finalize_output_prezeroed) {
++        check_cuda_error(cudaMemsetAsync(
++            final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
++      }
+     }
+   } else if (use_fp8) {
+     alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+@@ -3375,7 +4290,7 @@
+                       static_cast<ScaleBiasType const*>(fc2_lora), false, expert_first_token_offset,
+                       num_experts_per_node, hidden_size, expanded_num_rows,
+                       ActivationParams(ActivationType::Identity), {}, false, nullptr, enable_pdl,
+-                      stream);
++                      stream, nullptr, 0);
+     sync_check_cuda_error(stream);
+   }
+ 
+@@ -3635,7 +4550,8 @@
+            int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
+            bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
+            bool use_deepseek_fp8_block_scale, bool use_mxfp8_act_scaling, bool min_latency_mode,
+-           MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
++           MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
++           int const* vt_lens, int vt_batch_size, int const* oea_k0, double* oea_stats) {
+   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
+                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
+                                               use_wfp4a16;
+@@ -3677,6 +4593,13 @@
+   auto* blockscale_gemm_runner =
+       use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
+ 
++  TLLM_CHECK_WITH_INFO(vt_lens == nullptr ||
++                           (token_final_scales != nullptr && !min_latency_mode && !use_lora &&
++                            parallelism_config.ep_size == 1 && !enable_alltoall),
++                       "vt_lens requires scales and standard single-node routing without LoRA");
++  TLLM_CHECK_WITH_INFO(vt_lens == nullptr ||
++                           (vt_batch_size > 0 && num_rows >= 0 && num_rows % vt_batch_size == 0),
++                       "vt_lens requires a positive batch size dividing num_rows");
+   TLLM_CHECK(input_activations);
+   TLLM_CHECK(token_selected_experts);
+   TLLM_CHECK(fc1_expert_weights);
+@@ -3799,7 +4722,7 @@
+   int start_expert = num_experts_per_node * parallelism_config.ep_rank;
+   int end_expert = start_expert + num_experts_per_node;
+ 
+-  bool const needs_num_valid = parallelism_config.ep_size > 1;
++  bool const needs_num_valid = parallelism_config.ep_size > 1 || vt_lens != nullptr;
+   int64_t const* num_valid_tokens_ptr =
+       needs_num_valid ? expert_first_token_offset_ + num_experts_per_node : nullptr;
+ 
+@@ -3854,8 +4777,100 @@
+                 min_latency_params.active_expert_global_ids, enable_pdl);
+     sync_check_cuda_error(stream);
+   } else {
+-    bool fused_prologue_result = false;
+-    if (!use_w4_groupwise) {
++    // A3: the TMA descriptor kernel only needs expert_first_token_offset, so it can be folded
++    // into the routing prologue.  setupTmaWarpSpecializedInputs is host-only work apart from its
++    // final launch (and the WFP4AFP8 scale memset, which must stay after expandInputRows -- hence
++    // the fp8_mxfp4 gate), so it is safe to run it early and hand the launch to the prologue.
++    bool const try_fused_strides = fusedPrologueEnabled() && fusedStridesEnabled() &&
++                                   !use_w4_groupwise && !use_lora &&
++                                   !quant_params.fp8_mxfp4.fc1.weight_block_scale;
++    FusedPrologueRequest fused_prologue_req{};
++    fused_prologue_req.oea_k0 = oea_k0;
++    fused_prologue_req.oea_stats = oea_stats;
++    TmaWarpSpecializedGroupedGemmInput a3_gemm1_input{};
++    TmaWarpSpecializedGroupedGemmInput a3_gemm2_input{};
++    if (try_fused_strides) {
++      fused_prologue_req.token_selected_experts = token_selected_experts;
++      fused_prologue_req.permuted_row_to_unpermuted_row = permuted_row_to_unpermuted_row_;
++      fused_prologue_req.unpermuted_row_to_permuted_row = unpermuted_row_to_permuted_row;
++      fused_prologue_req.expert_first_token_offset = expert_first_token_offset_;
++      fused_prologue_req.num_tokens = num_rows;
++      fused_prologue_req.vt_lens = vt_lens;
++      fused_prologue_req.vt_batch_size = vt_batch_size;
++      // Tail write-back is required even when singleton pruning is disabled.
++      if (vt_lens != nullptr) {
++        fused_prologue_req.prune_ids_out = const_cast<int*>(token_selected_experts);
++        fused_prologue_req.prune_scales_out = const_cast<float*>(token_final_scales);
++      }
++      fused_prologue_req.experts_per_token = experts_per_token;
++      fused_prologue_req.start_expert = start_expert;
++      fused_prologue_req.end_expert = end_expert;
++      // G2-2: ask for the row expansion to be folded into the same launch.  The gate lives in
++      // tryFusedPrologueAndStrides; `expand_fused` below says whether it took the offer.
++      if (foldExpandEnabled() && use_fp4 && !use_awq && !use_w4afp8 && !use_lora &&
++          input_sf == nullptr && !use_wfp4afp8 && !use_mxfp8_act_scaling &&
++          quant_params.fp4.fc1.weight_block_scale && fc1_fp4_act_scale_ != nullptr) {
++        fused_prologue_req.expand_requested = true;
++        fused_prologue_req.expand_input = static_cast<void const*>(input_activations);
++        fused_prologue_req.expand_output = static_cast<void*>(permuted_data_);
++        fused_prologue_req.expand_unpermuted_scales = token_topk_unpermuted_scales;
++        fused_prologue_req.expand_permuted_scales = permuted_token_final_scales_;
++        fused_prologue_req.expand_act_sf_flat = fc1_fp4_act_scale_;
++        fused_prologue_req.expand_act_global_scale = quant_params.fp4.fc1.act_global_scale;
++        fused_prologue_req.expand_use_per_expert_act_scale =
++            use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
++        fused_prologue_req.expand_hidden_size = hidden_size;
++      }
++      // P2: ask for the singleton-route prune.  Single-node routing only (the -1 write-back is
++      // per-rank state).  None retains the legacy host-row gate and skip-on-decline policy;
++      // VT gates on device active rows and uses the standalone prune if fusion declines.
++      {
++        auto const& pc = moePruneConfig();
++        if (pc.tau > 0.f && token_final_scales != nullptr && parallelism_config.ep_size == 1 &&
++            (vt_lens != nullptr || (num_rows >= pc.min_rows && num_rows <= pc.max_rows)) &&
++            pc.min_rank < experts_per_token) {
++          fused_prologue_req.prune_tau = pc.tau;
++          fused_prologue_req.prune_min_rank = pc.min_rank;
++          fused_prologue_req.prune_min_rows = pc.min_rows;
++          fused_prologue_req.prune_max_rows = pc.max_rows;
++          fused_prologue_req.prune_scales = token_final_scales;
++          fused_prologue_req.prune_ids_out = const_cast<int*>(token_selected_experts);
++          fused_prologue_req.prune_scales_out = const_cast<float*>(token_final_scales);
++        }
++      }
++      std::tie(a3_gemm1_input, a3_gemm2_input) = setupTmaWarpSpecializedInputs(
++          num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
++          inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
++          fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases,
++          fc2_expert_biases, min_latency_mode, min_latency_params, use_lora, start_expert,
++          parallelism_config, enable_pdl, stream, &fused_prologue_req);
++    }
++    bool const strides_fused = fused_prologue_req.succeeded;
++    if (vt_lens != nullptr && !strides_fused && num_rows > 0) {
++      // No host length read or synchronization, and no reliance on the caller's pre-mask.
++      int const blocks = static_cast<int>(std::min<int64_t>(
++          (num_rows * experts_per_token + 255) / 256, 65535));
++      if (blocks > 0) {
++        auto const& pc = moePruneConfig();
++        if (pc.tau > 0.f && pc.min_rank < experts_per_token) {
++          prepareMoeVtPruneKernel<<<blocks, 256, 0, stream>>>(
++              token_selected_experts, token_final_scales, permuted_token_selected_experts_,
++              num_rows, experts_per_token, full_num_experts, vt_lens, vt_batch_size, pc.tau,
++              pc.min_rank, pc.min_rows, pc.max_rows);
++          check_cuda_error(cudaGetLastError());
++          applyMoeVtPruneKernel<<<blocks, 256, 0, stream>>>(
++              const_cast<int*>(token_selected_experts), const_cast<float*>(token_final_scales),
++              permuted_token_selected_experts_, num_rows * experts_per_token);
++        } else {
++          maskMoeVtTailKernel<<<blocks, 256, 0, stream>>>(
++              const_cast<int*>(token_selected_experts), const_cast<float*>(token_final_scales),
++              num_rows, experts_per_token, vt_lens, vt_batch_size);
++        }
++        check_cuda_error(cudaGetLastError());
++      }
++    }
++    bool fused_prologue_result = strides_fused;
++    if (!fused_prologue_result && !use_w4_groupwise) {
+       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
+       // W4AFP8
+       fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
+@@ -3896,23 +4911,33 @@
+     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
+     T* gemm1_input_expand =
+         use_w4afp8 ? reinterpret_cast<T*>(smoothed_act_) : reinterpret_cast<T*>(permuted_data_);
+-    expandInputRowsKernelLauncher(
+-        input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
+-        permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size,
+-        experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
+-        expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
+-        (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
+-        enable_pdl, stream);
++    // G2-2: skipped when the fused prologue already permuted and re-quantised the rows.
++    if (!fused_prologue_req.expand_fused) {
++      expandInputRowsKernelLauncher(
++          input_activations, gemm1_input_expand, token_topk_unpermuted_scales,
++          permuted_token_final_scales_, permuted_row_to_unpermuted_row_, num_rows, hidden_size,
++          experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
++          expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
++          (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
++          enable_pdl, stream);
++    }
+     auto const* gemm1_input = gemm1_input_expand;
+ 
+     sync_check_cuda_error(stream);
+ 
+-    auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
+-        num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
+-        inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+-        fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
+-        min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
+-        enable_pdl, stream);
++    TmaWarpSpecializedGroupedGemmInput gemm1_tma_ws_input;
++    TmaWarpSpecializedGroupedGemmInput gemm2_tma_ws_input;
++    if (strides_fused) {
++      gemm1_tma_ws_input = a3_gemm1_input;
++      gemm2_tma_ws_input = a3_gemm2_input;
++    } else {
++      std::tie(gemm1_tma_ws_input, gemm2_tma_ws_input) = setupTmaWarpSpecializedInputs(
++          num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
++          inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
++          fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases,
++          fc2_expert_biases, min_latency_mode, min_latency_params, use_lora, start_expert,
++          parallelism_config, enable_pdl, stream);
++    }
+ 
+     if (use_lora) {
+       bool all_token_without_lora = setupLoraWorkspace(
+@@ -3936,6 +4961,26 @@
+                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
+     }
+     sync_check_cuda_error(stream);
++
++    // G2-1: the fused-finalize output zeroing is a ~1.0 us memset32 launch sitting between
++    // doActivationKernel and GEMM2 in a strictly serial chain.  Hand it to doActivationKernel's
++    // grid instead (same position in the stream, one fewer launch).  Fails safe: any condition
++    // we do not cover leaves the memset where it was.
++    void* fused_zero_ptr = nullptr;
++    int64_t fused_zero_vec16 = 0;
++    if (foldMemsetEnabled() && !min_latency_mode &&
++        gemm2_tma_ws_input.fusion ==
++            TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE &&
++        moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_) && !use_lora &&
++        isGatedActivation(fc1_activation_type) && !use_w4afp8 && !blockscale_gemm_runner) {
++      size_t const zero_bytes =
++          sizeof(OutputType) * static_cast<size_t>(num_rows) * unpadded_hidden_size;
++      if (zero_bytes % 16 == 0 && (reinterpret_cast<uintptr_t>(final_output) % 16) == 0) {
++        fused_zero_ptr = final_output;
++        fused_zero_vec16 = static_cast<int64_t>(zero_bytes / 16);
++      }
++    }
++
+     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
+                 glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
+                 fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
+@@ -3943,7 +4988,7 @@
+                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
+                 hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
+                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
+-                nullptr, enable_pdl);
++                nullptr, enable_pdl, fused_zero_ptr, fused_zero_vec16);
+     sync_check_cuda_error(stream);
+ 
+     if (use_lora) {
+@@ -3964,7 +5009,8 @@
+         permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
+         expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+         experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
++        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl,
++        /*finalize_output_prezeroed*/ fused_zero_ptr != nullptr);
+     sync_check_cuda_error(stream);
+   }
+ }
+@@ -3985,7 +5031,7 @@
+         QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
+         UnfusedGemmOutputType* gemm1_output, UnfusedGemmOutputType* gemm2_output,
+         float const* router_scales, int const* permuted_row_to_unpermuted_row, bool enable_pdl,
+-        cudaStream_t stream) {
++        cudaStream_t stream, FusedPrologueRequest* fused_prologue) {
+   // Always nullptr
+   layout_info1.ptr_c = nullptr;
+   layout_info1.stride_c = nullptr;
+@@ -4024,6 +5070,19 @@
+   int const threads = std::min(32, num_experts_per_node);
+   int const blocks = (num_experts_per_node + threads - 1) / threads;
+ 
++  // A3: if the caller asked for it, run the routing prologue and this kernel as one launch.
++  // On failure nothing is launched -- the caller falls back to the standalone prologue and calls
++  // this function again in the usual place.
++  if (fused_prologue != nullptr) {
++    fused_prologue->succeeded =
++        tryFusedPrologueAndStrides<T, WeightType, OutputType, ScaleBiasType, InputType>(
++            *fused_prologue, layout_info1, layout_info2, num_experts_per_node, gemm1_n, gemm1_k,
++            gemm2_n, gemm2_k, gemm1_in, gemm2_in, weights1, weights2, alpha_scale_flat1,
++            alpha_scale_flat2, fp4_act_flat1, fp4_act_flat2, quant_params, bias1, bias2,
++            gemm1_output, gemm2_output, router_scales, enable_pdl, stream);
++    return std::make_pair(layout_info1, layout_info2);
++  }
++
+   auto* kernel_instance =
+       &computeStridesTmaWarpSpecializedKernel<T, WeightType, OutputType, ScaleBiasType>;
+ 
+@@ -4081,7 +5140,8 @@
+                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
+                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
+                                   int start_expert, MOEParallelismConfig parallelism_config,
+-                                  bool enable_pdl, cudaStream_t stream) {
++                                  bool enable_pdl, cudaStream_t stream,
++                                  FusedPrologueRequest* fused_prologue) {
+   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
+   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
+ 
+@@ -4183,6 +5243,32 @@
+     }
+ 
+     TLLM_CHECK_WITH_INFO(gemm1_input != gemm1_output, "Input and output buffers are overlapping");
++
++    // ---------------------------------- G1: group packing ----------------------------------
++    // Host side, with the tactic in hand.  The prologue does the actual remapping; here we only
++    // decide whether it may, and how short the group list can safely be: D is at most
++    // `expanded_num_rows` because an active expert owns at least one permuted row.
++    if (fused_prologue) {
++      G1PackParams g1{};
++      int const cta_tile_m = g1CtaTileM(*gemm1_config_);
++      bool const shape_ok = gemm1_tma_ws_input.swap_ab && cta_tile_m > 0 &&
++                            fc1_out_size % cta_tile_m == 0 &&
++                            num_rows <= 32;  // one N tile per expert
++      // The list only shrinks to `expanded_num_rows`; below a 4x shortening the fixed prologue
++      // cost eats the scheduler saving (see moePackMinRatio).
++      bool const ratio_ok =
++          expanded_num_rows * (int64_t)moePackMinRatio() <= (int64_t)num_experts_per_node;
++      g1.pack_groups = (moePackGroupsEnabled() && shape_ok && ratio_ok) ? 1 : 0;
++      if (g1.pack_groups) {
++        int64_t const groups = std::min<int64_t>(num_experts_per_node, expanded_num_rows);
++        g1.num_groups_gemm1 = (int)groups;
++        g1.num_groups_gemm2 = (int)groups;
++        gemm1_tma_ws_input.shape_info.num_groups = (int)groups;
++        gemm2_tma_ws_input.shape_info.num_groups = (int)groups;
++      }
++      fused_prologue->g1 = g1;
++    }
++
+     return Self::computeStridesTmaWarpSpecialized(
+         expert_first_token_offset_, gemm1_tma_ws_input, gemm2_tma_ws_input, num_rows,
+         expanded_num_rows, fc1_out_size, hidden_size, hidden_size, inter_size, num_experts_per_node,
+@@ -4191,7 +5277,7 @@
+         quant_params.fp8.dequant_fc2, fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params,
+         fc1_expert_biases, fc2_bias, reinterpret_cast<UnfusedGemmOutputType*>(gemm1_output),
+         reinterpret_cast<UnfusedGemmOutputType*>(fc2_result_), permuted_token_final_scales_,
+-        permuted_row_to_unpermuted_row_, enable_pdl, stream);
++        permuted_row_to_unpermuted_row_, enable_pdl, stream, fused_prologue);
+   }
+ }
+ 
+--- a/flashinfer/data/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
++++ b/flashinfer/data/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+@@ -1,3 +1,4 @@
++// Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ /*
+  * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+  *
+@@ -22,6 +23,8 @@
+ #endif
+ // Always include the public header for moe_gemm_kernels.h
+ 
++#include <limits>
++
+ #include <tvm/ffi/extra/module.h>
+ 
+ #include "../../tvm_ffi_utils.h"
+@@ -46,6 +49,31 @@
+ using tvm::ffi::Optional;
+ constexpr DLDataType dl_uint4x2 = DLDataType{kDLUInt, 4, 2};
+ 
++static void checkOeaInputs(TensorView input, Optional<TensorView> oea_k0,
++                           Optional<TensorView> oea_stats) {
++  for (auto const& item : {oea_k0, oea_stats}) {
++    if (item.has_value()) {
++      auto const& t = item.value();
++      TVM_FFI_ICHECK(t.IsContiguous());
++      TVM_FFI_ICHECK_EQ(t.dtype().lanes, 1);
++      TVM_FFI_ICHECK_EQ(t.ndim(), 1);
++      TVM_FFI_ICHECK_EQ(t.device().device_type, kDLCUDA);
++      TVM_FFI_ICHECK_EQ(t.device().device_id, input.device().device_id);
++    }
++  }
++  if (oea_k0.has_value()) {
++    // oea-sd: int32[2] = {k0, min_rows}; min_rows gates OEA on the rows that take part (VT live rows).
++    TVM_FFI_ICHECK_EQ(oea_k0.value().size(0), 2);
++    TVM_FFI_ICHECK_EQ(oea_k0.value().dtype().code, kDLInt);
++    TVM_FFI_ICHECK_EQ(oea_k0.value().dtype().bits, 32);
++  }
++  if (oea_stats.has_value()) {
++    TVM_FFI_ICHECK_EQ(oea_stats.value().size(0), 8);
++    TVM_FFI_ICHECK_EQ(oea_stats.value().dtype().code, kDLFloat);
++    TVM_FFI_ICHECK_EQ(oea_stats.value().dtype().bits, 64);
++  }
++}
++
+ class DtypeUtils {
+  public:
+   static nvinfer1::DataType dataType(DLDataType dtype) {
+@@ -257,13 +285,39 @@
+               int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+               bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+               ActivationType base_activation_type = ActivationType::Swiglu,
+-              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
++              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
++              Optional<TensorView> vt_lens = Optional<TensorView>{},
++              Optional<TensorView> oea_k0 = Optional<TensorView>{},
++              Optional<TensorView> oea_stats = Optional<TensorView>{}) {
+     std::lock_guard<std::mutex> lock(mMutex);
+     ffi::CUDADeviceGuard device_guard(input.device().device_id);
++    checkOeaInputs(input, oea_k0, oea_stats);
+ 
+     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
+         << "smart_router is supported in min_latency mode";
+ 
++    if (vt_lens.has_value()) {
++      CHECK_INPUT_AND_TYPE(vt_lens.value(), dl_int32);
++      CHECK_DIM(1, vt_lens.value());
++      TVM_FFI_ICHECK_GT(vt_lens.value().size(0), 0) << "vt_lens batch size must be positive";
++      TVM_FFI_ICHECK_LE(vt_lens.value().size(0), std::numeric_limits<int>::max())
++          << "vt_lens batch size is too large";
++      CHECK_DIM(2, input);
++      TVM_FFI_ICHECK_EQ(input.size(0) % vt_lens.value().size(0), 0)
++          << "num_tokens must be divisible by vt_lens batch size";
++      CHECK_DEVICE(vt_lens.value(), input);
++      CHECK_INPUT(token_selected_experts);
++      CHECK_DEVICE(token_selected_experts, input);
++      TVM_FFI_ICHECK(token_final_scales.has_value()) << "vt_lens requires token_final_scales";
++      CHECK_INPUT(token_final_scales.value());
++      CHECK_DEVICE(token_final_scales.value(), input);
++      TVM_FFI_ICHECK(!min_latency_mode && ep_size == 1 && !enable_alltoall)
++          << "vt_lens requires standard single-node routing without all-to-all";
++#ifndef USING_OSS_CUTLASS_MOE_GEMM
++      TVM_FFI_ICHECK(false) << "vt_lens requires the OSS CUTLASS MoE backend";
++#endif
++    }
++
+     CHECK_INPUT_TYPE(input, mActivationDtype)
+     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
+     if (token_final_scales) {
+@@ -411,7 +465,11 @@
+         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+         enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+-        min_latency_mode, min_latency_params, enable_pdl, stream);
++        min_latency_mode, min_latency_params, enable_pdl, stream,
++        vt_lens.has_value() ? static_cast<int const*>(vt_lens.value().data_ptr()) : nullptr,
++        vt_lens.has_value() ? static_cast<int>(vt_lens.value().size(0)) : 1,
++        oea_k0.has_value() ? static_cast<int const*>(oea_k0.value().data_ptr()) : nullptr,
++        oea_stats.has_value() ? static_cast<double*>(oea_stats.value().data_ptr()) : nullptr);
+ #else
+     mKernelRunner->runMoe(
+         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
+@@ -444,9 +502,12 @@
+                          int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                          Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+                          ActivationType base_activation_type = ActivationType::Swiglu,
+-                         Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
++                         Optional<TensorView> workspace_buffer = Optional<TensorView>{},
++                         Optional<TensorView> oea_k0 = Optional<TensorView>{},
++                         Optional<TensorView> oea_stats = Optional<TensorView>{}) {
+     std::lock_guard<std::mutex> lock(mMutex);
+     ffi::CUDADeviceGuard device_guard(input.device().device_id);
++    checkOeaInputs(input, oea_k0, oea_stats);
+ 
+     CHECK_INPUT_TYPE(input, mActivationDtype)
+     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
+@@ -601,7 +662,10 @@
+         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
+         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+         enable_alltoall, use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
+-        min_latency_mode, min_latency_params, enable_pdl, stream);
++        min_latency_mode, min_latency_params, enable_pdl, stream, /*vt_lens=*/nullptr,
++        /*vt_batch_size=*/1,
++        oea_k0.has_value() ? static_cast<int const*>(oea_k0.value().data_ptr()) : nullptr,
++        oea_stats.has_value() ? static_cast<double*>(oea_stats.value().data_ptr()) : nullptr);
+ #else
+     mKernelRunner->runMoe(
+         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
+@@ -756,13 +820,35 @@
+                  bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
+                  int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
++                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
++                 Optional<TensorView> oea_k0, Optional<TensorView> oea_stats) {
++            runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
++                   fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
++                   swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
++                   ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
++                   profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type),
++                   workspace_buffer, /*vt_lens=*/Optional<TensorView>{}, oea_k0, oea_stats);
++          });
++    } else if (name == "run_moe_vt") {
++      return Function::FromTyped(
++          [this](TensorView output, TensorView input, TensorView token_selected_experts,
++                 Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
++                 Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
++                 Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
++                 Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
++                 Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
++                 bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
++                 int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
++                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
++                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
++                 Optional<TensorView> vt_lens, Optional<TensorView> oea_k0,
++                 Optional<TensorView> oea_stats) {
+             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
+                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
+                    swiglu_alpha, swiglu_beta, swiglu_limit, swizzled_input_sf, tp_size, tp_rank,
+                    ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
+                    profile_ids, enable_pdl, static_cast<ActivationType>(base_activation_type),
+-                   workspace_buffer);
++                   workspace_buffer, vt_lens, oea_k0, oea_stats);
+           });
+     } else if (name == "run_moe_min_latency") {
+       return Function::FromTyped(
+@@ -777,7 +863,8 @@
+                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
+                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
++                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
++                 Optional<TensorView> oea_k0, Optional<TensorView> oea_stats) {
+             runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
+                               fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                               fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
+@@ -785,7 +872,8 @@
+                               experts_to_token_score, active_expert_global_ids, tp_size, tp_rank,
+                               ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
+                               min_latency_mode, profile_ids, enable_pdl,
+-                              static_cast<ActivationType>(base_activation_type), workspace_buffer);
++                              static_cast<ActivationType>(base_activation_type), workspace_buffer,
++                              oea_k0, oea_stats);
+           });
+     } else if (name == "get_workspace_size") {
+       return Function::FromTyped([this](int64_t num_rows, int64_t hidden_size, int64_t inter_size,
+--- a/flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
++++ b/flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+@@ -1,3 +1,4 @@
++// Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ /*
+  * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+  *
+@@ -444,6 +445,65 @@
+         active_expert_global_ids(active_expert_global_ids) {}
+ };
+ 
++// A3: request for fusing the routing prologue into computeStridesTmaWarpSpecialized.
++// Deliberately free of the runner's template parameters so it can cross the (declared in this
++// header, defined in cutlass_fused_moe_kernels.cuh) boundary without new instantiations.
++// G1: how the grouped-GEMM problem list is laid out.  Filled by
++// setupTmaWarpSpecializedInputs, consumed by the fused routing+strides prologue.
++// All-zero == upstream behaviour.
++struct G1PackParams {
++  int pack_groups = 0;       // pack the D active experts into groups [0, D)
++  int num_groups_gemm1 = 0;  // shortened CUTLASS group-list lengths (0 = unchanged)
++  int num_groups_gemm2 = 0;
++};
++
++struct FusedPrologueRequest {
++  G1PackParams g1{};
++  int const* token_selected_experts = nullptr;
++  int* permuted_row_to_unpermuted_row = nullptr;
++  int* unpermuted_row_to_permuted_row = nullptr;
++  int64_t* expert_first_token_offset = nullptr;
++  int64_t num_tokens = 0;
++  int const* vt_lens = nullptr;  // CUDA int32[vt_batch_size], min(rows, max(0, L) + 1) per request
++  int vt_batch_size = 1;
++  int experts_per_token = 0;
++  int start_expert = 0;
++  int end_expert = 0;
++  bool succeeded = false;  // set by computeStridesTmaWarpSpecialized
++
++  // G2-2: fold expandInputRowsKernel (the permute + NVFP4 re-quantisation of the routed rows)
++  // into the same launch.  The host fills these in and then checks `expand_fused`; when that is
++  // false the standalone expandInputRowsKernel launch must still be made.
++  bool expand_requested = false;
++  bool expand_fused = false;
++  void const* expand_input = nullptr;   // InputType const*, [num_tokens, hidden_size]
++  void* expand_output = nullptr;        // T*, [num_tokens * k, hidden_size]
++  float const* expand_unpermuted_scales = nullptr;
++  float* expand_permuted_scales = nullptr;
++  TmaWarpSpecializedGroupedGemmInput::ElementSF* expand_act_sf_flat = nullptr;
++  float const* expand_act_global_scale = nullptr;
++  bool expand_use_per_expert_act_scale = false;
++  int64_t expand_hidden_size = 0;
++
++  // P2: singleton-route pruning folded into the same launch.  A route whose expert is used by
++  // exactly one row of this call (pre-prune count == 1), whose routing weight is < `prune_tau`
++  // and whose within-row rank is >= `prune_min_rank` is dropped *before* the radix rank, so the
++  // permutation, the expert offsets, the G1 packing and the G2-2 row expansion are all built
++  // from the pruned set.  `prune_tau <= 0` is off and leaves the upstream path byte-identical.
++  // The dropped routes are written back as id -1 / weight 0 (same convention as SGLang's P1
++  // Triton kernel) so the unfused finalize kernels skip them.
++  int const* oea_k0 = nullptr;
++  double* oea_stats = nullptr;
++  float prune_tau = 0.f;
++  int prune_min_rank = 1;
++  int prune_min_rows = 0;
++  int prune_max_rows = 0;
++  float const* prune_scales = nullptr;  // token_final_scales, [num_tokens, experts_per_token]
++  int* prune_ids_out = nullptr;         // token_selected_experts, written in place
++  float* prune_scales_out = nullptr;    // token_final_scales, written in place
++  bool prune_fused = false;             // set when the launch that ran carried the prune
++};
++
+ class CutlassMoeFCRunnerInterface {
+  public:
+   virtual ~CutlassMoeFCRunnerInterface() = default;
+@@ -473,7 +533,9 @@
+                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+                       bool use_mxfp8_act_scaling, bool min_latency_mode,
+                       MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+-                      cudaStream_t stream) = 0;
++                      cudaStream_t stream, int const* vt_lens = nullptr,
++                      int vt_batch_size = 1, int const* oea_k0 = nullptr,
++                      double* oea_stats = nullptr) = 0;
+ 
+   // Aliases for profiling the gemms
+   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
+@@ -679,7 +741,9 @@
+               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+               bool use_mxfp8_act_scaling, bool min_latency_mode,
+               MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+-              cudaStream_t stream) override;
++              cudaStream_t stream, int const* vt_lens = nullptr,
++              int vt_batch_size = 1, int const* oea_k0 = nullptr,
++              double* oea_stats = nullptr) override;
+ 
+   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
+   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
+@@ -705,7 +769,10 @@
+                     ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+                     bool bias_is_broadcast, cudaStream_t stream,
+                     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
++                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++                    // G2-1: when non-null, doActivationKernel zeroes [fused_zero_ptr,
++                    // fused_zero_ptr + 16 * fused_zero_vec16) so gemm2 can skip its memset.
++                    void* fused_zero_ptr = nullptr, int64_t fused_zero_vec16 = 0);
+ 
+   static void gemm2(
+       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
+@@ -726,7 +793,9 @@
+       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
+       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
+       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
+-      bool enable_pdl);
++      bool enable_pdl,
++      // G2-1: set when gemm1's doActivationKernel already zeroed final_output.
++      bool finalize_output_prezeroed = false);
+ 
+   // Overrides to allow us to forward on to the internal functions with the pointers using the
+   // correct type
+@@ -860,7 +929,8 @@
+                                 ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
+                                 MoeMinLatencyParams& min_latency_params, bool use_lora,
+                                 int start_expert, MOEParallelismConfig parallelism_config,
+-                                bool enable_pdl, cudaStream_t stream);
++                                bool enable_pdl, cudaStream_t stream,
++                                FusedPrologueRequest* fused_prologue = nullptr);
+ 
+   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
+   computeStridesTmaWarpSpecialized(
+@@ -874,7 +944,8 @@
+       TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2, QuantParams quant_params,
+       ScaleBiasType const* bias1, ScaleBiasType const* bias2, UnfusedGemmOutputType* gemm1_output,
+       UnfusedGemmOutputType* gemm2_output, float const* router_scales,
+-      int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream);
++      int const* permuted_row_to_unpermuted_row, bool enable_pdl, cudaStream_t stream,
++      FusedPrologueRequest* fused_prologue = nullptr);
+   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
+   computeStridesTmaWarpSpecializedLowLatency(
+       TmaWarpSpecializedGroupedGemmInput layout_info1,
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -1,3 +1,4 @@
++# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ """
+ Copyright (c) 2025 by FlashInfer team.
+ 
+@@ -509,7 +510,13 @@
+ 
+     @register_custom_op(
+         "flashinfer::cutlass_fused_moe",
+-        mutates_args=("output", "workspace_buffer"),
++        mutates_args=(
++            "output",
++            "workspace_buffer",
++            "token_selected_experts",
++            "token_final_scales",
++            "oea_stats",
++        ),
+     )
+     def cutlass_fused_moe(
+         output: torch.Tensor,
+@@ -545,6 +552,9 @@
+         use_fused_finalize: bool = True,
+         profile_ids: Optional[List[int]] = None,
+         workspace_buffer: Optional[torch.Tensor] = None,
++        vt_lens: Optional[torch.Tensor] = None,
++        oea_k0: Optional[torch.Tensor] = None,
++        oea_stats: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+         if enable_pdl is None:
+             enable_pdl = device_support_pdl(input.device)
+@@ -606,11 +616,16 @@
+             gemm_idx=2,
+         )
+ 
+-        run_moe = (
+-            moe_runner.fused_moe_runner.run_moe_min_latency
+-            if min_latency_mode
+-            else moe_runner.fused_moe_runner.run_moe
+-        )
++        if vt_lens is not None:
++            if min_latency_mode:
++                raise ValueError("vt_lens is not supported in min_latency_mode")
++            run_moe = moe_runner.fused_moe_runner.run_moe_vt
++        else:
++            run_moe = (
++                moe_runner.fused_moe_runner.run_moe_min_latency
++                if min_latency_mode
++                else moe_runner.fused_moe_runner.run_moe
++            )
+         num_active_experts_per_node = torch.empty(
+             (1,), dtype=torch.int32, device=input.device
+         )
+@@ -661,6 +676,9 @@
+             enable_pdl,
+             activation_type,
+             workspace_buffer,
++            *((vt_lens,) if vt_lens is not None else ()),
++            oea_k0,
++            oea_stats,
+         )
+ 
+         return (
+@@ -709,6 +727,9 @@
+         use_fused_finalize: bool = True,
+         profile_ids: Optional[List[int]] = None,
+         workspace_buffer: Optional[torch.Tensor] = None,
++        vt_lens: Optional[torch.Tensor] = None,
++        oea_k0: Optional[torch.Tensor] = None,
++        oea_stats: Optional[torch.Tensor] = None,
+     ) -> List[torch.Tensor]:
+         seq_len = input.shape[0]
+         hidden_size = fc2_expert_weights.shape[1]
+@@ -943,6 +964,9 @@
+     use_fused_finalize: bool = True,
+     profile_ids: Optional[List[int]] = None,
+     workspace_buffer: Optional[torch.Tensor] = None,
++    vt_lens: Optional[torch.Tensor] = None,
++    oea_k0: Optional[torch.Tensor] = None,
++    oea_stats: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
+ 
+@@ -958,6 +982,13 @@
+         For FP8, the input must be quantized.
+         For NVFP4, both quantized and non-quantized inputs are supported.
+ 
++    oea_k0 : Optional[torch.Tensor]
++        Device int32[2] runtime OEA control {k0, min_rows}. k0 of 0 or outside (0, top_k) uses
++        production pruning; otherwise OEA applies when at least min_rows rows take part (the
++        live rows 0..L under vt_lens, every row otherwise).
++    oea_stats : Optional[torch.Tensor]
++        Device float64[8] accumulated counters; may be supplied without oea_k0.
++
+     token_selected_experts : torch.Tensor
+         Indices of selected experts for each token.
+ 
+@@ -1116,6 +1147,19 @@
+     - Currently, some advanced features like FP8 block scaling and minimum latency mode
+         are not implemented for Blackwell architecture.
+     """
++    if vt_lens is not None:
++        if vt_lens.ndim != 1 or vt_lens.shape[0] <= 0:
++            raise ValueError("vt_lens must have shape [bs] with bs > 0")
++        check_shape_dtype_device(
++            vt_lens, (vt_lens.shape[0],), torch.int32, input.device, "vt_lens"
++        )
++        if input.shape[0] % vt_lens.shape[0] != 0:
++            raise ValueError("num_tokens must be divisible by vt_lens batch size")
++        if not vt_lens.is_cuda or not vt_lens.is_contiguous():
++            raise ValueError("vt_lens must be a contiguous CUDA int32[bs] tensor")
++        if min_latency_mode or ep_size != 1 or enable_alltoall:
++            raise ValueError("vt_lens requires standard single-node routing without all-to-all")
++
+     major, minor = get_compute_capability(input.device)
+     device_arch = f"{major * 10 + minor}"
+ 
+@@ -1186,6 +1230,9 @@
+             use_fused_finalize=use_fused_finalize,
+             profile_ids=profile_ids,
+             workspace_buffer=workspace_buffer,
++            **({"vt_lens": vt_lens} if vt_lens is not None else {}),
++            oea_k0=oea_k0,
++            oea_stats=oea_stats,
+         )
+ 
+ 
+--- a/flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
++++ b/flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
+@@ -1,3 +1,4 @@
++# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ """CuTeDSL GDN MTP Decode Kernel — WY-parallel, NOPREPACK variant.
+ 
+ v6 (TMA + SW128 swizzle on H tile):
+@@ -1974,8 +1975,54 @@
+ _NATIVE_T = _os.environ.get("FLASHINFER_GDN_WY_NATIVE_T", "1") != "0"
+ # (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
+ # stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
+-# q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
++# q/k/v copies from the verify region. Valid on the native path (T in {4,8}) and,
++# since the T16-strided patch, on the full-tile path (T == T_KERNEL == 16, the W16
++# NEXTN verify shape) where n_valid == T so no smem-tail zeroing is involved.
++# NOTE: the strided read forces `mk_dyn` onto the fully-static descriptor fallback,
++# so the compile cache key gains (B, pool_size) — one cute.compile per CUDA-graph
++# batch bucket at warm-up instead of one for all of them.
+ _STRIDED_QKV = _os.environ.get("FLASHINFER_GDN_WY_STRIDED_QKV", "0") != "0"
++
++
++def _strided_qkv_ok(q, k, v, n_valid, H, HK, HV, K_dim, V_dim):
++    """True iff q/k/v can be read in place with one shared per-token row stride.
++
++    The kernel does not use the CuTe layouts of q/k/v at all: it takes their base
++    pointers (``gQ.iterator.toint()``) and addresses every element with the strides
++    rebuilt in ``_kernel_body`` as
++
++        base + b*(n_valid*rs) + t*rs + head*(K_DIM | V_DIM) + col
++
++    so the only stride it can absorb is the per-token one, and it must be the SAME
++    for q, k and v.  Everything else has to already be the canonical compact value:
++
++      * feature stride 1 and head stride K_DIM / V_DIM (features stay contiguous
++        inside a token in the conv-output column slices),
++      * batch stride exactly ``n_valid * rs`` (checked only when B > 1; at B == 1
++        the kernel multiplies it by pid_b == 0),
++      * ``rs`` a multiple of 8 elements and every base pointer 16 B aligned, because
++        the q/k/v loads are 16 B ``cp.async.ca`` (8 bf16) instructions.
++
++    The pre-existing native-short-T path only compared ``stride(1)``; a caller with
++    a non-canonical head or batch stride would have been read as garbage.  Using
++    this predicate there too can only turn the optimisation OFF (falling back to
++    ``.contiguous()``), never change a result.
++    """
++    rs = q.stride(1)
++    if k.stride(1) != rs or v.stride(1) != rs:
++        return False
++    if rs <= 0 or rs % 8 != 0:  # 16 B cp.async granularity
++        return False
++    for t, heads, feat in ((q, H, K_dim), (k, HK, K_dim), (v, HV, V_dim)):
++        if t.stride(-1) != 1:
++            return False
++        if heads > 1 and t.stride(2) != feat:
++            return False
++        if t.shape[0] > 1 and t.stride(0) != n_valid * rs:
++            return False
++        if (t.data_ptr() % 16) != 0:
++            return False
++    return True
+ # (native-a/b) read a/b directly from the real [B, n_valid, HV] tensors instead of staging
+ # them into T_KERNEL-row zero-padded buffers (removes the 2 a/b staging copies). Bit-exact on
+ # the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
+@@ -2135,9 +2182,19 @@
+         False  # True => a/b read native [B,n_valid,HV] (no staging); _NATIVE_AB
+     )
+     if T == T_KERNEL:
+-        q = q.contiguous()
+-        k = k.contiguous()
+-        v = v.contiguous()
++        # (strided-qkv at the full tile) n_valid == T == T_KERNEL here, so the kernel
++        # takes its plain path: every row is loaded, no smem tail zeroing, identical
++        # MMA schedule. The ONLY thing the strided read changes is the gmem address
++        # arithmetic for q/k/v (token stride `rs` instead of the compact H*K_DIM /
++        # HV*V_DIM), so the loaded values — and therefore the output — are identical
++        # to staging the same columns into a contiguous buffer first. This removes the
++        # three big q/k/v copies (one per GDN layer) from the W16 verify region.
++        if _STRIDED_QKV and _strided_qkv_ok(q, k, v, n_valid, H, HK, HV, K_dim, V_dim):
++            _qkv_rs = q.stride(1)
++        else:
++            q = q.contiguous()
++            k = k.contiguous()
++            v = v.contiguous()
+         a = a.contiguous()
+         b = b.contiguous()
+     elif _native:
+@@ -2146,7 +2203,7 @@
+         # Strided-qkv: q/k/v are the fused conv-output column slices (token stride =
+         # conv_dim, features contiguous within a token). Pass that row stride to the
+         # kernel and skip the copies — bit-identical (same values, strided gmem read).
+-        if _STRIDED_QKV and q.stride(1) == k.stride(1) == v.stride(1):
++        if _STRIDED_QKV and _strided_qkv_ok(q, k, v, n_valid, H, HK, HV, K_dim, V_dim):
+             _qkv_rs = q.stride(1)
+         else:
+             q = q.contiguous()
+--- a/flashinfer/jit/core.py
++++ b/flashinfer/jit/core.py
+@@ -1,3 +1,4 @@
++# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ import abc
+ import dataclasses
+ import functools
+@@ -410,6 +411,14 @@
+         return None
+ 
+     def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
++        # A copied cache retains old absolute paths, which can make ninja rebuild every
++        # translation unit and exhaust server memory. Load the cached .so as-is.
++        if os.environ.get("FLASHINFER_P2_NO_NINJA"):
++            if self.is_compiled:
++                return
++            raise MissingJITCacheError(
++                f"FLASHINFER_P2_NO_NINJA: {self.name} is not compiled in this cache", spec=self
++            )
+         if os.environ.get("FLASHINFER_DISABLE_JIT"):
+             raise MissingJITCacheError(
+                 "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
+--- a/flashinfer/jit/fused_moe.py
++++ b/flashinfer/jit/fused_moe.py
+@@ -1,3 +1,4 @@
++# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+ """
+ Copyright (c) 2025 by FlashInfer team.
+ 
+@@ -159,7 +160,7 @@
+         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
+ 
+     return gen_jit_spec(
+-        f"fused_moe_{device_arch}",
++        f"fused_moe_{device_arch}_vtoea_prologue_v1",
+         [
+             jit_env.FLASHINFER_CSRC_DIR
+             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",

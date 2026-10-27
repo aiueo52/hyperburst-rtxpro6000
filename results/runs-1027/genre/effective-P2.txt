@@ -1,0 +1,208 @@
+# $REPO = the fork checkout at the measured commit, with the assembled FlashInfer trees (its tokenmaps/ holds
+# the public maps of the G runs, not used by this run); <previous-build> = the previous best build (2026-10-22); /home/user = the home directory;
+# environment as resolved by the launcher, without cache, scratch and identity variables; ARG = server arguments
+# <private-mtp-head> = the checkpoint with the private fine-tuned MTP head; <private-mtp-head-overlay> = the ThinkingCap overlay with that head; <private-token-map>, <private-token-map-32768> = the private 49,152-row draft map and its 32,768-row recurrent-head map (none of them published)
+ADAPTIVE_CONFIG=$REPO/adaptive/w16_c4.json
+CC=/usr/bin/gcc
+CONC=4
+CPATH=/home/user/tools/mamba/envs/cuda13/targets/x86_64-linux/include
+CUDACXX=/home/user/tools/mamba/envs/cuda13/bin/nvcc
+CUDAHOSTCXX=/usr/bin/g++
+CUDA_DEVICE_ORDER=PCI_BUS_ID
+CUDA_HOME=/home/user/tools/mamba/envs/cuda13
+CXX=/usr/bin/g++
+DISPLAY_RESERVE_GB=7
+FLASHINFER_GDN_WY_STRIDED_QKV=1
+FLASHINFER_MOE_PACK_GROUPS=1
+FLASHINFER_NO_DOWNLOAD=1
+FLASHINFER_P2_NO_NINJA=1
+FLASH_NEXT_EDITION=hyperpro
+FLASH_NEXT_PD_INTERVAL=0
+FLASH_NEXT_RECUR_HEAD=<private-token-map-32768>
+GPU_MEMORY_GB=95.6
+HF_HUB_OFFLINE=1
+LIBRARY_PATH=/home/user/tools/mamba/envs/cuda13/lib
+MAMBA_SLOTS=20
+PORT=30000
+PYTHONDONTWRITEBYTECODE=1
+PYTHONNOUSERSITE=1
+PYTHONPATH=$REPO/flashinfer-vtoea:$REPO/python
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+SGLANG_ADAPTIVE_POLICY=confidence
+SGLANG_ADAPTIVE_STEP_A=7.943
+SGLANG_ADAPTIVE_STEP_B=0.5554
+SGLANG_ADAPTIVE_TARGET_AUTOTUNE=1
+SGLANG_DRAFT_LOGITS_OUT=1
+SGLANG_DRAFT_SKIP_VOCAB_WEIGHTS=1
+SGLANG_ENABLE_QSA_SHARED_TAIL_PREFIX=1
+SGLANG_FP8_W8A16_GEMV=1
+SGLANG_FP8_W8A16_GEMV_MAX_M=32
+SGLANG_GDN_AB_STASH_DIRECT=1
+SGLANG_GDN_BA_TRITON_GEMV=1
+SGLANG_GDN_CONV_CHAIN_PARALLEL=1
+SGLANG_GDN_PROJ_DIRECT_LAYOUT=1
+SGLANG_HC_APPLY_MIX_FUSED=1
+SGLANG_HC_GATE_EARLY=2
+SGLANG_HC_LAYER_APPLY_FUSED=1
+SGLANG_HC_MIX2=1
+SGLANG_HC_MIX2_FP8=1
+SGLANG_KV_FP8_FUSED_STORE=1
+SGLANG_LMHEAD_NVFP4=0
+SGLANG_LOG_MS=1
+SGLANG_MOE_PRUNE_IN_PROLOGUE=1
+SGLANG_MOE_PRUNE_SINGLETON_TAU=0.08
+SGLANG_MTP_EMBED_TABLE=1
+SGLANG_MTP_LMHEAD_NVFP4=1
+SGLANG_NORM_INTO_GEMV=1
+SGLANG_NVFP4_GEMV_MAX_M=32
+SGLANG_OEA_K0=6
+SGLANG_OEA_MIN_ROWS=16
+SGLANG_OEA_MODE=oea
+SGLANG_OEA_STATS=0
+SGLANG_OPT_COMMIT_GLUE_FUSED=1
+SGLANG_OPT_DRAFT_EXTEND_LENS=1
+SGLANG_OPT_DRAFT_MOE_GEMV=1
+SGLANG_OPT_DRAFT_TAIL=1
+SGLANG_OPT_GDN_FRONT_OVERLAP=1
+SGLANG_OPT_MAMBA_NONE_MODE_SIZING=1
+SGLANG_OPT_QSA_DRAFT_META_BATCH=1
+SGLANG_OPT_RS_EXTEND_FUSED_CONF=1
+SGLANG_OPT_RS_EXTEND_TAIL=1
+SGLANG_OPT_SPEC_SPARSE_RS=1
+SGLANG_OPT_SPEC_SPARSE_TOPK=1
+SGLANG_OPT_SPEC_SPARSE_VERIFY=1
+SGLANG_OPT_TRITON_DECODE_ATTN=1
+SGLANG_QSA_META_PAGE_PARALLEL=1
+SGLANG_RND_DL_HOSTW=0
+SGLANG_RND_DL_STEPUP=1
+SGLANG_RND_DL_STEPUP31=0
+SGLANG_RND_DL_TAU=0
+SGLANG_RND_DL_TAU_BY_S=3:0.1,7:0.2,15:0.4,31:0.5
+SGLANG_RND_DRAFT_CTX_TOPK=0
+SGLANG_RND_DRAFT_CTX_VOCAB=256
+SGLANG_RND_MTP_RECUR_HEAD=<private-token-map-32768>
+SGLANG_RND_PLE_SIDE=1
+SGLANG_RND_PLE_SIDE_PARTS=ab
+SGLANG_RND_VT_GRAMMAR=1
+SGLANG_ROUTER_FAST_TOPK=1
+SGLANG_ROUTER_GEMV=1
+SGLANG_RS_BLOCK_VERIFY=1
+SGLANG_RS_DRAFT_ONEHOT_ABOVE=0.9
+SGLANG_RS_DRAFT_TEMP_SCALE=0.7
+SGLANG_RS_DRAFT_TOPK=16
+SGLANG_RS_GREEDY_FAST=1
+SGLANG_SHARED_GATEUP_FUSED=0
+SGLANG_SHARED_GATE_EARLY=1
+SGLANG_SPEC_MIN_P=1
+SGLANG_TACTIC_ROWS=0
+SGLANG_TRITON_PDL=1
+TARGET_MODEL=<private-mtp-head-overlay>
+TOKEN_MAP=<private-token-map>
+TORCH_CUDA_ARCH_LIST=12.0
+WA_MEM_FRACTION=0.96
+ARG --model-path
+ARG <private-mtp-head-overlay>
+ARG --load-format
+ARG safetensors
+ARG --served-model-name
+ARG flash-next
+ARG --host
+ARG 127.0.0.1
+ARG --port
+ARG 30000
+ARG --tp
+ARG 1
+ARG --dtype
+ARG bfloat16
+ARG --quantization
+ARG modelopt_fp4
+ARG --kv-cache-dtype
+ARG fp8_e4m3
+ARG --mem-fraction-static
+ARG 0.96
+ARG --context-length
+ARG 262144
+ARG --page-size
+ARG 64
+ARG --max-running-requests
+ARG 4
+ARG --sleep-on-idle
+ARG --chunked-prefill-size
+ARG 8192
+ARG --mamba-radix-cache-strategy
+ARG extra_buffer
+ARG --mamba-ssm-dtype
+ARG bfloat16
+ARG --max-mamba-cache-size
+ARG 20
+ARG --gdn-mtp-cache-mode
+ARG none
+ARG --linear-attn-decode-backend
+ARG flashinfer
+ARG --linear-attn-prefill-backend
+ARG flashinfer
+ARG --ple-offload-embedding
+ARG --chat-template
+ARG <private-mtp-head-overlay>/chat_template.jinja
+ARG --reasoning-parser
+ARG qwen3
+ARG --tool-call-parser
+ARG qwen3_coder
+ARG --default-chat-template-kwargs
+ARG {"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}
+ARG --speculative-algorithm
+ARG NEXTN
+ARG --speculative-num-steps
+ARG 3
+ARG --speculative-eagle-topk
+ARG 1
+ARG --speculative-num-draft-tokens
+ARG 4
+ARG --speculative-draft-model-quantization
+ARG unquant
+ARG --watchdog-timeout
+ARG 1800
+ARG --speculative-token-map
+ARG <private-token-map>
+ARG --qwen4-exp-dense-fp8
+ARG shared_expert,attn,linear_attn,lm_head,mtp_dense
+ARG --speculative-draft-model-quantization
+ARG modelopt_fp4
+ARG --enable-metrics
+ARG --max-running-requests
+ARG 4
+ARG --cuda-graph-bs-decode
+ARG 1
+ARG 2
+ARG 3
+ARG 4
+ARG --chunked-prefill-size
+ARG 8192
+ARG --enable-hierarchical-cache
+ARG --hicache-size
+ARG 32
+ARG --hicache-host-memory-mode
+ARG cache
+ARG --hicache-write-policy
+ARG write_through
+ARG --hicache-io-backend
+ARG kernel
+ARG --hicache-mem-layout
+ARG page_first
+ARG --speculative-use-rejection-sampling
+ARG --speculative-num-steps
+ARG 15
+ARG --speculative-num-draft-tokens
+ARG 16
+ARG --mem-fraction-static
+ARG 0.886778242678
+ARG --speculative-adaptive
+ARG --speculative-adaptive-config
+ARG $REPO/adaptive/w16_c4.json
+ARG --enable-request-time-stats-logging
+ARG --decode-log-interval
+ARG 10
+ARG --enable-request-time-stats-logging
+ARG --decode-log-interval
+ARG 10
+ARG --admin-api-key=<redacted>

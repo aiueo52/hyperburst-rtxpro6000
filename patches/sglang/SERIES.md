@@ -125,3 +125,23 @@ Base: `jpezzulli/sglang-rtxpro6000` @ `16e5682aad` (branch `pennyroyal-main-sm12
 | 0119 | fb1e77a05a | 10-01 | RS3: block verification in the sparse chain RS verify (SGLANG_RS_BLOCK_VERIFY) | 6 |
 | 0120 | a78b1a5ebd | 10-01 | RS3: vectorize block verification over the chain (one scan, no per-position loop) | 1 |
 | 0121 | 7118260ce3 (merge of d680442609, 1df3112044, 8801f24173, 47d1b4e8ab) | 10-02 | Candidate 2026-10-02: merge the RS package (opus/rs3-bv) and XA1 on ST1 (opus/xa-st1) | 3 |
+
+`perf-1027-core.diff` is the standalone 2026-10-27 snapshot of `python/`, `test/`, and `docs/`.
+Apply it alone to the pristine pinned base, not after the numbered series. It leaves out the five
+files that the release removes for licensing reasons, so it contains none of their content. After
+`git apply`, remove them by path in the SGLang checkout; the two steps reproduce `d21289f` exactly:
+
+```bash
+git rm -- \
+  python/sglang/kernels/aot/csrc/elementwise/fused_add_rms_norm_kernel.mu \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer.cpp \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer_gpu.cu \
+  python/sglang/kernels/ops/diffusion/ext/hunyuan3d_rasterizer/rasterizer.h \
+  python/sglang/kernels/ops/diffusion/ext/mesh_processor/mesh_processor.cpp
+```
+
+This matches the fork's `MODIFICATIONS.md`, “Removed base-fork files” (see the
+[mirrored notice](MODIFICATIONS.md#removed-base-fork-files)). The removed upstream test is not
+one of these licensing removals; its deletion is included in the core diff. The numbered
+series above is unchanged; `flash-next-series` still ends at the 2026-10-02 tree.
+See [patch documentation](../README.md).

@@ -272,6 +272,35 @@ def build() -> str:
         ("runs-1002/pub1006/D-public-wa-greedy.jsonl", "`wa`, **public components only**"),
         ("runs-1002/pub1006/E-public-w4-greedy.jsonl", "`w4`, **public components only**"),
     ], ["code-edit", "prose-en", "prose-ja", "agent-loop"], with_range=True)
+    L += ["", "## 9. Final 2026-10-27 release, 8 held-out prompts, public components (2026-10-27 JST)", "",
+          "The final 2026-10-27 release (the fork's code with `launch/2026-10-27/serve-fast.sh`) with the launcher's default",
+          "settings, `CONC=4 bash serve-fast.sh wa`: up to four running requests, mem fraction 0.96 less the 7 GB display reserve,",
+          "`MAMBA_SLOTS=20`, context 262,144, chunked prefill 8192; except port 30000 and FlashInfer modules loaded from an",
+          "earlier build of the same sources (`PREBUILT_CACHE=1`, see `runs-1027/README.md`); hyper pro with the locally built",
+          "ThinkingCap overlay. The previous best build (2026-10-22, normal, one running request) is a same-window reference.",
+          "All three used the fork's public maps (`public_49152.pt`, recurrent head `public_32768.pt`) and the checkpoint's",
+          "original MTP head. Same 32 prompts and caps as section 8, thinking on, greedy, one request at a time, one server start",
+          "per run, screen off (`conditions.json`); launch settings in `effective-*.txt`. Each server first got one unmeasured",
+          "8-token streaming request: SGLang labels its generated-token counter by streaming mode, and that series must exist",
+          "before fnbench reads acceptance. Cells: mean t/s (min–max) / mean acceptance.", ""]
+    L += workload_table([
+        ("runs-1027/genre/G1-release-normal.jsonl", "`wa`, release normal, public components"),
+        ("runs-1027/genre/G2-release-hyperpro.jsonl", "`wa`, release hyper pro, public components"),
+        ("runs-1027/genre/G3-previous-normal.jsonl", "previous best build (2026-10-22), normal, public components"),
+    ], ["code-edit", "prose-en", "prose-ja", "agent-loop"], with_range=True)
+    L += ["", "## 10. Final 2026-10-27 release, 8 held-out prompts, private components (2026-10-27 JST)", "",
+          "The three runs of section 9 repeated with the author's private components, which are not published: the fine-tuned",
+          "MTP head v5 (for hyper pro, on the ThinkingCap overlay) and the private 49,152-row draft map with its 32,768-row",
+          "recurrent-head map, the pair of the 12-start comparisons in the README. The previous best build used the same files,",
+          "as its production entry does. Everything else as in section 9; `effective-P*.txt` differ from `effective-G*.txt` only",
+          "in these paths. A first hyper pro attempt was stopped when the screen turned on and was repeated from a fresh server",
+          "start; its numbers are not published (`conditions.json`). These runs cannot be reproduced from this repository.",
+          "Cells: mean t/s (min–max) / mean acceptance.", ""]
+    L += workload_table([
+        ("runs-1027/genre/P1-release-normal-private.jsonl", "`wa`, release normal, private head + maps"),
+        ("runs-1027/genre/P2-release-hyperpro-private.jsonl", "`wa`, release hyper pro, private head + maps"),
+        ("runs-1027/genre/P3-previous-normal-private.jsonl", "previous best build (2026-10-22), normal, private head + maps"),
+    ], ["code-edit", "prose-en", "prose-ja", "agent-loop"], with_range=True)
     L.append("")
     return "\n".join(L)
 

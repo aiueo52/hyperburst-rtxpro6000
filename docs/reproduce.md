@@ -12,7 +12,7 @@ the published tables. Nothing here downloads weights for you or changes system s
 The commands below use two absolute paths; set them once in your shell:
 
 ```bash
-export REPO=/path/to/flash-next-rtxpro6000        # this repository
+export REPO=/path/to/hyperburst-rtxpro6000        # this repository
 export WORK=/path/to/workdir                       # where the SGLang clone goes
 export SGLANG_DIR=$WORK/sglang-rtxpro6000
 ```
@@ -33,7 +33,7 @@ export SGLANG_DIR=$WORK/sglang-rtxpro6000
 
 ```bash
 git clone https://github.com/jpezzulli/sglang-rtxpro6000 "$SGLANG_DIR"
-"$REPO"/patches/sglang/apply.sh "$SGLANG_DIR"       # branch flash-next-fast = base + 121 patches
+"$REPO"/patches/sglang/apply.sh "$SGLANG_DIR"       # branch flash-next-series = base + 121 patches
 ```
 
 Patches 0001-0105 are the 2026-09-08 tree, 0106-0121 the 2026-10-02 additions. Every 2026-10 feature is
@@ -144,6 +144,11 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 - `--allow-proc sglang` lets the GPU guard accept the server's own process.
 - The server must run with `--enable-metrics` (the launcher sets it) so that acceptance can be read
   from `/metrics`.
+- On a fresh server that has not yet served a streaming request, send one short streaming request before a
+  `--require-acceptance` prompt-set run, for example
+  `curl -sN http://127.0.0.1:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"flash-next","messages":[{"role":"user","content":"Say hello."}],"max_tokens":8,"stream":true}' >/dev/null`.
+  SGLang labels its generated-token counter by streaming mode, and the start-up warm-up is not streamed, so
+  without this request fnbench stops at the first prompt with `missing_or_changed_series`.
 - Compare with `results/runs/p2m2332-*.jsonl` (headline) and `results/bn1-study-v2/` (sets), e.g. by
   copying your stripped files next to them (`results/strip_runs.py in.jsonl out.jsonl`).
 - For A/B decisions use the protocol in `measurement.md` (fresh server per arm, ABBA, 8 prompts per

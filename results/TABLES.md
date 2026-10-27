@@ -177,3 +177,38 @@ MTP head v5 + private 49k map, as in sections 1–7. Cells: mean t/s (min–max)
 | `runs-1002/pub1006/C-prod-wa-lmstudio.jsonl` (2026-10-06 03:40 JST, n=8) | `wa`, private head + map | lmstudio | 568 (486–651) / 10.09 | 240 (218–253) / 2.35 | 310 (231–744) / 3.41 | 340 (322–367) / 4.04 |
 | `runs-1002/pub1006/D-public-wa-greedy.jsonl` (2026-10-06 03:57 JST, n=8) | `wa`, **public components only** | greedy | 468 (401–560) / 8.07 | 232 (224–241) / 2.28 | 248 (223–298) / 2.42 | 307 (291–343) / 3.36 |
 | `runs-1002/pub1006/E-public-w4-greedy.jsonl` (2026-10-06 04:15 JST, n=8) | `w4`, **public components only** | greedy | 356 (321–375) / 3.72 | 241 (224–266) / 2.29 | 254 (239–280) / 2.42 | 301 (294–313) / 2.91 |
+
+## 9. Final 2026-10-27 release, 8 held-out prompts, public components (2026-10-27 JST)
+
+The final 2026-10-27 release (the fork's code with `launch/2026-10-27/serve-fast.sh`) with the launcher's default
+settings, `CONC=4 bash serve-fast.sh wa`: up to four running requests, mem fraction 0.96 less the 7 GB display reserve,
+`MAMBA_SLOTS=20`, context 262,144, chunked prefill 8192; except port 30000 and FlashInfer modules loaded from an
+earlier build of the same sources (`PREBUILT_CACHE=1`, see `runs-1027/README.md`); hyper pro with the locally built
+ThinkingCap overlay. The previous best build (2026-10-22, normal, one running request) is a same-window reference.
+All three used the fork's public maps (`public_49152.pt`, recurrent head `public_32768.pt`) and the checkpoint's
+original MTP head. Same 32 prompts and caps as section 8, thinking on, greedy, one request at a time, one server start
+per run, screen off (`conditions.json`); launch settings in `effective-*.txt`. Each server first got one unmeasured
+8-token streaming request: SGLang labels its generated-token counter by streaming mode, and that series must exist
+before fnbench reads acceptance. Cells: mean t/s (min–max) / mean acceptance.
+
+| run | profile / note | sampling | code-edit | prose-en | prose-ja | agent-loop |
+|---|---|---|---|---|---|---|
+| `runs-1027/genre/G1-release-normal.jsonl` (2026-10-27 11:00 JST, n=8) | `wa`, release normal, public components | greedy | 611 (529–680) / 8.75 | 279 (272–285) / 2.43 | 288 (265–371) / 2.48 | 382 (357–410) / 3.75 |
+| `runs-1027/genre/G2-release-hyperpro.jsonl` (2026-10-27 11:17 JST, n=8) | `wa`, release hyper pro, public components | greedy | 657 (575–731) / 9.36 | 270 (259–294) / 2.39 | 288 (257–339) / 2.55 | 367 (350–389) / 3.62 |
+| `runs-1027/genre/G3-previous-normal.jsonl` (2026-10-27 11:31 JST, n=8) | previous best build (2026-10-22), normal, public components | greedy | 617 (582–679) / 9.35 | 277 (257–299) / 2.42 | 292 (268–326) / 2.52 | 379 (361–395) / 3.74 |
+
+## 10. Final 2026-10-27 release, 8 held-out prompts, private components (2026-10-27 JST)
+
+The three runs of section 9 repeated with the author's private components, which are not published: the fine-tuned
+MTP head v5 (for hyper pro, on the ThinkingCap overlay) and the private 49,152-row draft map with its 32,768-row
+recurrent-head map, the pair of the 12-start comparisons in the README. The previous best build used the same files,
+as its production entry does. Everything else as in section 9; `effective-P*.txt` differ from `effective-G*.txt` only
+in these paths. A first hyper pro attempt was stopped when the screen turned on and was repeated from a fresh server
+start; its numbers are not published (`conditions.json`). These runs cannot be reproduced from this repository.
+Cells: mean t/s (min–max) / mean acceptance.
+
+| run | profile / note | sampling | code-edit | prose-en | prose-ja | agent-loop |
+|---|---|---|---|---|---|---|
+| `runs-1027/genre/P1-release-normal-private.jsonl` (2026-10-27 18:28 JST, n=8) | `wa`, release normal, private head + maps | greedy | 764 (722–825) / 11.68 | 297 (282–314) / 2.50 | 326 (312–362) / 2.74 | 438 (394–493) / 4.24 |
+| `runs-1027/genre/P2-release-hyperpro-private.jsonl` (2026-10-27 18:51 JST, n=8) | `wa`, release hyper pro, private head + maps | greedy | 768 (665–836) / 11.41 | 300 (279–373) / 2.61 | 322 (298–357) / 2.74 | 434 (418–457) / 4.41 |
+| `runs-1027/genre/P3-previous-normal-private.jsonl` (2026-10-27 19:05 JST, n=8) | previous best build (2026-10-22), normal, private head + maps | greedy | 724 (684–755) / 11.35 | 302 (286–319) / 2.57 | 365 (305–421) / 3.17 | 434 (412–467) / 4.32 |

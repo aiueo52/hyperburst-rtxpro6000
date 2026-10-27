@@ -1,0 +1,145 @@
+{
+ "suite": "bench/workloads/sets/*-v1, 32 prompts, same ids, hashes and caps as runs-1002/pub1006",
+ "runs": {
+  "G1-release-normal": {
+   "components": "public",
+   "started_utc": "2026-10-27T02:00:34.850859+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 4,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  },
+  "G2-release-hyperpro": {
+   "components": "public",
+   "started_utc": "2026-10-27T02:17:54.258781+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 4,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  },
+  "G3-previous-normal": {
+   "components": "public",
+   "started_utc": "2026-10-27T02:31:53.217414+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 1,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  },
+  "P1-release-normal-private": {
+   "components": "private (not shipped)",
+   "started_utc": "2026-10-27T09:28:14.620836+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 4,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  },
+  "P2-release-hyperpro-private": {
+   "components": "private (not shipped)",
+   "started_utc": "2026-10-27T09:51:43.691347+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 4,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  },
+  "P3-previous-normal-private": {
+   "components": "private (not shipped)",
+   "started_utc": "2026-10-27T10:05:23.153771+00:00",
+   "server_starts": 1,
+   "requests": 32,
+   "display_before": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "display_after": {
+    "visible_windows": 0,
+    "compositing": false,
+    "screen": "Off"
+   },
+   "max_running_requests": 1,
+   "unmeasured_streaming_warmup": {
+    "max_tokens": 8,
+    "http_status": 200,
+    "done": true
+   }
+  }
+ },
+ "excluded_attempts": [
+  {
+   "run": "P2-release-hyperpro-private",
+   "started_utc": "2026-10-27T09:43:03.554274+00:00",
+   "requests_before_stop": 16,
+   "reason": "the screen turned on during the run (an input device woke the display); the run was stopped and repeated from a fresh server start, and its numbers are not published"
+  }
+ ]
+}
