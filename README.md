@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/hyperburst-logo.png" alt="hyperburst" width="600"></p>
+
 # Qwen3.8-Flash-Next: fast single-stream decode on one RTX PRO 6000 Blackwell Max-Q
 
 [日本語版 README](README.ja.md)

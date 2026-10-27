@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/hyperburst-logo.png" alt="hyperburst" width="600"></p>
+
 # Qwen3.8-Flash-Next を RTX PRO 6000 Blackwell Max-Q 1 枚で速く動かした記録
 
 [English README](README.md)
