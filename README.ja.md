@@ -59,6 +59,8 @@ AI の言語モデル **Qwen3.8-Flash-Next**(NVFP4 という 4 ビット形式�
   - SGLang 自身の JIT カーネル(小さいもの 3 つ)も、初回起動の準備完了前にビルドします。aiueo52 と貢献者のマシンでは合計 13–17 s でした。`PATH` に `ninja` が必要です(venv にインストールされるので、有効にして実行してください)。ないと最初のリクエストでサーバーが停止します。
   - この時間には、実行時の初回使用でコンパイルするカーネル(CuTe-DSL の NVFP4 量子化、Triton)と CUDA グラフのキャプチャは含みません。GPU が必要なため、別には計っていません。
 - メインメモリ: 既定設定のサーバープロセスで約 100 GiB(実測の最大 100.5 GiB。モデルとオフロードで約 67 GiB、HiCache のホスト側プールが 32 GB)。`CONC=4` でプールを減らすには `FLASH_NEXT_HICACHE_GB` を下げます。計測したマシンは 256 GB です。
+  - 約 67 GiB の大半は、ピン留めした PLE の埋め込み表です。中身は 47.7 GiB ですが、PyTorch 2.13 はピン留めするホストメモリの大きさを 2 の累乗に切り上げるため、既定では表が 64 GiB を使います。
+  - 表を 47.7 GiB に抑えるには、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,pinned_max_round_threshold_mb:1024` を付けて起動します(起動スクリプトは利用者が付けた値を使います。`expandable_segments:True` は既定の値です)。この設定と `FLASH_NEXT_HICACHE_GB=0`(`CONC=4`)で normal を 1 回起動したところ、swap なしの 56 GiB のメモリ上限(cgroup の `MemoryMax`)の中で動き、プロセスのメモリの最大は 53.6 GiB でした。GSM8K 200 問では、以前の既定の起動と 195 問で当たり外れが一致し(同じ日の既定の起動では 193 問)、31,321 トークンの入力にも正しく答えました。設定なしでは、同じ上限で表をピン留めする途中に強制終了されました。上限は 256 GB のマシンにかけたもので、64 GB のマシンでは試していません。64 GB のマシンのメモリは約 59.6 GiB なので、OS とほかのすべてに残るのは約 6 GiB です。`FLASH_NEXT_HICACHE_GB=0` のままにしてください。
 - 重みは含みません(下の「アセット」参照)。Normal は RadixArk/Qwen3.8-Flash-Next-NVFP4、hyper pro はそのモデルに ThinkingCap を重ねた手元のオーバーレイを使います。`tools/thinkingcap_overlay/overlay.py` で作り、新しいファイルが 16 GB、残りは元ファイルへのリンクです。
 
 フォークのブランチを取得したあと、上にリンクした上流の `BUILD.md` に従って venv を作り、有効にしてください。検証したのは、その venv と `serve-fast.sh` の組み合わせだけです。**このブランチを pip でインストールする方法(例: `pip install ./python`)は未検証・非対応です**。
