@@ -115,6 +115,16 @@ FlashInfer は、変更・追加したファイルだけを `flashinfer-overlays
 
 制御ファイルの既定は `~/.cache/flash-next-fast/hyperpro/oea/flash-next.ctl`、応答の記録は隣の `.status.jsonl` です。`XDG_CACHE_HOME` や `SGLANG_OEA_CTL_FILE` を変更する場合は、起動スクリプトと `oea` に同じ設定を渡してください。このヘルパーは動作中の hyperpro サーバーを制御するもので、起動するものではありません。
 
+#### 任意: 専門家の置き場(VRAM を減らす)
+
+この枝には、任意で使える専門家の置き場もあります。`EXPERT_TIER_K=<K>` で、MoE の層ごとに K 人の専門家を VRAM に置き、ほかの専門家はトークンが必要としたときに host のメモリ(モデルのファイルの mmap)から写します。既定は切で、`EXPERT_TIER_K=0` では何も変わりません。公開の文から作った hot set を `expert-tier/hot-set.json` に同梱しています。
+
+```bash
+CONC=8 EXPERT_TIER_K=320 FLASH_NEXT_EDITION=normal bash serve-fast.sh wa
+```
+
+このコマンドをそのまま使った測定(context 262,144・HiCache 32 GB)では、VRAM の山は 66,230 MiB、1 本あたりの速さは c1 で 232 tok/s、c8 で 112 tok/s(全体 869 tok/s)でした。VRAM をさらに減らす設定(K216・profile W4・running 4)では、VRAM の山は 48,172 MiB、速さは置き場なしの 86% でした。前提・制限・測定値と、自分用の hot set の作り方は fork の [`docs/expert-tier.ja.md`](https://github.com/aiueo52/sglang-rtxpro6000/blob/flash-next-fast/docs/expert-tier.ja.md) にあります。
+
 ### 計測結果
 
 マシンは RTX PRO 6000 Blackwell (Max-Q) 1 枚で、同じ GPU が 4K の画面も表示しています。計測中は画面を消しました。比較はそれぞれ、同じ版の従来の最良ビルドに対して行いました(このリリースの前に使っていたビルドで、normal は 2026-10-22、hyper pro は 2026-10-23 のものです。下で説明している 2026-10-02 版とは別のもので、単独では公開していません)。サーバーを交互に起動し(A B B A のブロック)、起動の組に対する 95 % 区間を計算しています。比率・品質・BetterBench の計測は、リリースに向けたライセンス・パッケージ・起動スクリプトの整理より前のものです。下のジャンル別の表は、最終リリースで測りました。

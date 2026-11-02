@@ -114,6 +114,16 @@ After startup completes, use `./oea status`, `./oea on`, `./oea off` or `./oea r
 
 The default control file is `~/.cache/flash-next-fast/hyperpro/oea/flash-next.ctl`; acknowledgements are in the adjacent `.status.jsonl` file. If you override `XDG_CACHE_HOME` or `SGLANG_OEA_CTL_FILE`, pass the same settings to the launcher and `oea`. The helper controls an already-running hyperpro server; it does not start one.
 
+#### Optional: expert tier (lower VRAM)
+
+The branch also has an opt-in expert tier. `EXPERT_TIER_K=<K>` keeps K routed experts per MoE layer in VRAM and copies the others from host memory (an mmap of the model files) when a token needs them. It is off by default; `EXPERT_TIER_K=0` changes nothing. A hot set built from public text ships in `expert-tier/hot-set.json`.
+
+```bash
+CONC=8 EXPERT_TIER_K=320 FLASH_NEXT_EDITION=normal bash serve-fast.sh wa
+```
+
+With this command as shipped (context 262,144, HiCache 32 GB) the measured peak VRAM was 66,230 MiB, and speed per request was 232 tok/s at c1 and 112 tok/s at c8 (869 tok/s in total). A lower-VRAM setting (K216, profile W4, running 4) peaked at 48,172 MiB at 86% of the no-tier speed. Requirements, limits, measurements and how to build your own hot set are in the fork's [`docs/expert-tier.md`](https://github.com/aiueo52/sglang-rtxpro6000/blob/flash-next-fast/docs/expert-tier.md).
+
 ### Measured results
 
 The machine was one RTX PRO 6000 Blackwell (Max-Q), which also drives a 4K desktop; the screen was off during measurement. Each comparison was made against our previous best build of the same edition (the builds served before this release: 2026-10-22 for normal, 2026-10-23 for hyper pro; not the 2026-10-02 build documented further down, and not published separately), with alternating server starts (A B B A blocks) and 95 % intervals over the start pairs. The ratio, quality and BetterBench measurements predate the release's licensing, packaging and launcher cleanups; the per-genre table below was measured on the final release.
