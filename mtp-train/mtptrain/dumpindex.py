@@ -46,6 +46,7 @@ import torch
 
 from .data import Sample, _hash_ids, iter_dump_files, load_concat
 from .fileio import write_json_atomic
+from .paths import dump_input, dump_path, dump_root
 
 INDEX_FILE = "index.json"
 FILES_FILE = "index.files.json"
@@ -63,9 +64,11 @@ def file_stream(rel: str) -> str:
     return os.path.join(head, stem.rsplit("-", 1)[0] if "-" in stem else "")
 
 
-def _read_index_tensors(path: str):
+def _read_index_tensors(path: str, *, dump_dir: Optional[str] = None):
     from safetensors import safe_open
 
+    root = dump_dir if dump_dir is not None else os.path.dirname(os.path.abspath(path))
+    path = dump_input(root, path)
     with safe_open(path, framework="pt", device="cpu") as f:
         ids = f.get_tensor("input_ids")
         pos = f.get_tensor("positions")
@@ -81,8 +84,7 @@ def scan(dump_dir: str) -> Tuple[dict, int, List[str]]:
     it would silently drop the requests it held -- and any continuation of
     them -- from every later step.  Move or repair it and index again.
     """
-    if not os.path.isdir(dump_dir):
-        raise SystemExit(f"dump dir {dump_dir!r}: no such directory")
+    dump_dir = dump_root(dump_dir)
     index: dict = {}
     bad: List[str] = []
     orphans: List[str] = []
@@ -94,7 +96,7 @@ def scan(dump_dir: str) -> Tuple[dict, int, List[str]]:
     for path in iter_dump_files(dump_dir):
         rel = os.path.relpath(path, dump_dir)
         try:
-            ids, pos, offs = _read_index_tensors(path)
+            ids, pos, offs = _read_index_tensors(path, dump_dir=dump_dir)
         except Exception as exc:  # noqa: BLE001
             print(f"[index] unreadable {rel}: {type(exc).__name__}: {exc}")
             bad.append(rel)
@@ -144,14 +146,16 @@ def _disk_state(dump_dir: str) -> Dict[str, list]:
     The index is a cache of what the files' ``input_ids``/``positions`` say,
     keyed on this state: any change of it rebuilds the index, and nothing in
     an index is trusted across a changed key."""
+    dump_dir = dump_root(dump_dir)
     out = {}
     for path in iter_dump_files(dump_dir):
+        resolved = dump_input(dump_dir, path)
         try:
-            st = os.stat(path)
+            st = os.stat(resolved)
             key = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev]
         except OSError:
             key = [-1, -1, -1, -1, -1]  # dangling symlink
-        target = os.path.realpath(path) if os.path.islink(path) else None
+        target = resolved if os.path.islink(path) else None
         out[os.path.relpath(path, dump_dir)] = key + [target]
     return out
 
@@ -162,7 +166,9 @@ def _files_path(out: str) -> str:
 
 def build(dump_dir: str, out: Optional[str] = None) -> dict:
     """Full scan; writes ``index.json`` and ``index.files.json`` and returns the index."""
-    out = out or os.path.join(dump_dir, INDEX_FILE)
+    dump_dir = dump_root(dump_dir)
+    out = dump_input(dump_dir, out) if out is not None else dump_path(dump_dir, INDEX_FILE)
+    dump_input(dump_dir, _files_path(out))
     t0 = time.time()
     state = _disk_state(dump_dir)  # before the scan: a file changed meanwhile looks stale
     index, n, _bad = scan(dump_dir)
@@ -182,11 +188,13 @@ def is_current(dump_dir: str, out: Optional[str] = None) -> bool:
     of every file.  Rewriting a file in place changes its ctime even when the
     size and mtime are restored, so the index is rebuilt.
     """
-    out = out or os.path.join(dump_dir, INDEX_FILE)
+    dump_dir = dump_root(dump_dir)
+    out = dump_input(dump_dir, out) if out is not None else dump_path(dump_dir, INDEX_FILE)
+    meta_path = dump_input(dump_dir, _files_path(out))
     try:
-        with open(_files_path(out)) as fh:
+        with open(dump_input(dump_dir, meta_path)) as fh:
             meta = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, json.JSONDecodeError):
         return False
     return bool(os.path.exists(out) and meta.get("version") == INDEX_VERSION
                 and meta.get("files") == _disk_state(dump_dir))
@@ -197,13 +205,16 @@ def load_index(dump_dir: str, reindex: bool = False) -> dict:
 
     A dump directory that cannot be written to is indexed in memory.
     """
-    dump_dir = os.path.expanduser(dump_dir)
-    if not os.path.isdir(dump_dir):
-        raise SystemExit(f"dump dir {dump_dir!r}: no such directory")
-    out = os.path.join(dump_dir, INDEX_FILE)
+    dump_dir = dump_root(dump_dir)
+    out = dump_path(dump_dir, INDEX_FILE)
     if not reindex and is_current(dump_dir, out):
-        with open(out) as fh:
-            return json.load(fh)
+        with open(dump_input(dump_dir, out)) as fh:
+            index = json.load(fh)
+        for entry in index.values():
+            files, _seqs = pieces(entry)
+            for name in files + [entry["file"]]:
+                dump_path(dump_dir, name)
+        return index
     try:
         return build(dump_dir, out)
     except OSError as exc:
@@ -212,8 +223,13 @@ def load_index(dump_dir: str, reindex: bool = False) -> dict:
 
 
 def pieces(entry: dict) -> Tuple[List[str], List[int]]:
-    return (list(entry.get("files") or [entry["file"]]),
-            list(entry.get("seqs") or [entry["seq"]]))
+    files = entry.get("files") or [entry["file"]]
+    seqs = entry.get("seqs") or [entry["seq"]]
+    if (not isinstance(files, (list, tuple)) or not isinstance(seqs, (list, tuple))
+            or not files or len(files) != len(seqs)
+            or any(type(s) is not int or s < 0 for s in seqs)):
+        raise ValueError("invalid dump index pieces")
+    return list(files), list(seqs)
 
 
 def documents(index: dict, wanted: Optional[Iterable[str]] = None) -> List[Tuple[str, dict]]:
@@ -250,8 +266,10 @@ def load_document(
     again and ``DocumentMismatch`` is raised when they do not match (a dump
     file changed under a still-current-looking index).
     """
+    dump_dir = dump_root(dump_dir)
     files, seqs = pieces(entry)
-    sample = load_concat([os.path.join(dump_dir, f) for f in files], seqs)
+    sample = load_concat([dump_path(dump_dir, f) for f in files], seqs,
+                         dump_dir=dump_dir)
     if expect is not None and sample.doc_hash != expect:
         raise DocumentMismatch(
             f"{expect}: the ids in {files} (slots {seqs}) hash to {sample.doc_hash}"
@@ -270,10 +288,13 @@ def read_arrays(dump_dir: str, entry: dict, names: Sequence[str]) -> Dict[str, t
     """Named per-row dump tensors of one document, concatenated over its pieces."""
     from safetensors import safe_open
 
+    dump_dir = dump_root(dump_dir)
     files, seqs = pieces(entry)
+    for name in files:
+        dump_path(dump_dir, name)
     parts: Dict[str, list] = {n: [] for n in names}
     for name, s in zip(files, seqs):
-        with safe_open(os.path.join(dump_dir, name), framework="pt", device="cpu") as f:
+        with safe_open(dump_path(dump_dir, name), framework="pt", device="cpu") as f:
             keys = set(f.keys())
             if "seq_offsets" in keys:
                 offs = f.get_tensor("seq_offsets").tolist()

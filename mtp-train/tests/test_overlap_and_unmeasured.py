@@ -76,9 +76,11 @@ def test_eval_set_from_another_dump_sharing_documents_is_refused(tmp):
     build_eval_set(b, None, rows=10_000, holdout=0.5)
     ev = json.load(open(os.path.join(b, "eval_fixed.json")))
     assert {d["doc_hash"] for d in ev["docs"]} & train_docs  # the fixture overlaps
+    eval_path = os.path.join(a, "eval_other.json")
+    shutil.copy(os.path.join(b, "eval_fixed.json"), eval_path)
     out = os.path.join(tmp, "out")
     _exit(lambda: train(_args(*DUMP_RUN, "--dump-dir", a, "--out", out, "--eval-set",
-                              os.path.join(b, "eval_fixed.json"))),
+                              eval_path)),
           "overlap the training data", "--eval-set", "same token ids")
     assert not os.path.exists(out)
     # the eval set of the training dump itself is disjoint and accepted
@@ -121,7 +123,7 @@ def test_eval_set_split_keys_are_checked_against_training(tmp):
     cfg = MTPConfig.tiny()
     ids = [(j * 3 + 1) % cfg.vocab_size for j in range(24)]
     tgt = ids[1:] + [0]
-    path = os.path.join(b, "dump-1-00000000.safetensors")
+    path = os.path.join(b, "dump-2-00000000.safetensors")
     _write_dump(path, [(ids, tgt, 0)], hc_dim=cfg.hc_size)
     h = load_dump_file(path)[0].doc_hash
     assert h not in {r["doc_hash"] for r in rows}
@@ -133,9 +135,11 @@ def test_eval_set_split_keys_are_checked_against_training(tmp):
     build_eval_set(b, None, rows=10_000, holdout=0.5)
     ev = json.load(open(os.path.join(b, "eval_fixed.json")))
     assert ev["docs"][0]["split_keys"] == sorted([held, train_key])
+    shutil.copy(path, a)
+    eval_path = os.path.join(a, "eval_other.json")
+    shutil.copy(os.path.join(b, "eval_fixed.json"), eval_path)
     _exit(lambda: train(_args(*DUMP_RUN, "--dump-dir", a, "--out",
-                              os.path.join(tmp, "out"), "--eval-set",
-                              os.path.join(b, "eval_fixed.json"))),
+                              os.path.join(tmp, "out"), "--eval-set", eval_path)),
           "from a training source document", h)
 
 

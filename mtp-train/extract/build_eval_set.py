@@ -20,6 +20,7 @@ from mtptrain.cli import StrictParser  # noqa: E402
 from mtptrain.data import DumpDataset, _hash_ids  # noqa: E402
 from mtptrain.dumpindex import pieces, read_arrays  # noqa: E402
 from mtptrain.fileio import move_aside, read_jsonl, write_json_atomic  # noqa: E402
+from mtptrain.paths import dump_path, dump_root, input_path  # noqa: E402
 
 VOCAB = 248320
 
@@ -35,21 +36,18 @@ def build_eval_set(dump: str, out: str = None, rows: int = 200_000,
     ``.previous-<time>/`` next to it: runs that scored against it would
     otherwise silently change meaning.
     """
-    dump = os.path.abspath(os.path.expanduser(dump))  # absolute: a pointer file
-    if not os.path.isdir(dump):
-        raise SystemExit(f"dump dir {dump}: no such directory")
+    dump = dump_root(dump)  # absolute: a pointer file
     if rows <= 0 or max_len < 1:
         raise SystemExit("--rows and --max-len must be positive")
     if not 0.0 < holdout <= 1.0:
         raise SystemExit("--holdout must be in (0, 1]: 0 holds nothing out")
-    out = os.path.abspath(os.path.expanduser(out or os.path.join(dump, "eval_fixed.json")))
+    out = str(input_path(out or os.path.join(dump, "eval_fixed.json")))
     if os.path.isdir(out):
         raise SystemExit(f"--out {out} is a directory")
     man = {}
-    mpath = os.path.join(dump, "manifest.jsonl")
     # No manifest: a dump made without the client (DumpDataset then uses
     # every indexed document); an empty one selects nothing (refused below).
-    for r in read_jsonl(mpath, missing_ok=True):
+    for r in read_jsonl(dump_path(dump, "manifest.jsonl"), missing_ok=True):
         man[r["doc_hash"]] = r
 
     ds = DumpDataset(dump, split="eval", holdout_frac=holdout, seed=seed)
@@ -94,7 +92,7 @@ def build_eval_set(dump: str, out: str = None, rows: int = 200_000,
                 break
             hashes.append(doc_hash)
             names, seqs = pieces(entry)
-            paths = [os.path.join(dump, f) for f in names]
+            paths = [dump_path(dump, f) for f in names]
             # the source-document keys, so a trainer can check that none of
             # them is in its training split (overlap by document, not only by hash)
             docs.append({"doc_hash": doc_hash, "pieces": names, "files": paths,
@@ -114,7 +112,7 @@ def build_eval_set(dump: str, out: str = None, rows: int = 200_000,
                "fraction": frac, "by_bucket": dict(per_bucket)}
     if os.path.lexists(out):
         try:
-            with open(out) as fh:
+            with open(input_path(out)) as fh:
                 same = json.load(fh) == json.loads(json.dumps(payload))
         except (OSError, ValueError):
             same = False

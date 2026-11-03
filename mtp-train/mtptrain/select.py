@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 from .data import Sample, is_holdout_key, truncate
+from .paths import dump_input, dump_path, dump_root, input_path
 
 
 @dataclass
@@ -88,6 +89,7 @@ def select_selfgen_docs(
     at every row, but after a rejection the text follows the sampled token
     rather than the target's, so the replay is no longer exactly the server's.
     """
+    dump_dir = dump_root(dump_dir)
     if split not in ("eval", "train", "all"):
         raise SystemExit(f"split must be eval, train or all, not {split!r}")
     if per_bucket < 0 or min_gen < 0:
@@ -96,11 +98,12 @@ def select_selfgen_docs(
         index = load_index(dump_dir, reindex=reindex)
     # The self-generated documents are known only from the manifest, so it
     # must exist (the default one included); read_jsonl refuses a missing file.
-    manifest = manifest or os.path.join(dump_dir, "manifest.jsonl")
+    manifest = (dump_input(dump_dir, manifest) if manifest is not None
+                else dump_path(dump_dir, "manifest.jsonl"))
     wanted = set(buckets) if buckets else None
     from .fileio import read_jsonl  # tolerates a crash-truncated last line
 
-    rows = read_jsonl(manifest)
+    rows = read_jsonl(dump_input(dump_dir, manifest))
     if wanted:
         known = {r.get("bucket") or "selfgen" for r in rows if r.get("mode") == "selfgen"}
         if wanted - known:
@@ -163,6 +166,7 @@ def load_selfgen_samples(
     """
     from .dumpindex import DocumentMismatch, load_document
 
+    dump_dir = dump_root(dump_dir)
     out = SelfgenSet()
     for r in chosen:
         try:
@@ -188,7 +192,7 @@ def load_selfgen_samples(
 
 def load_token_map(path: str, vocab_size: int) -> torch.Tensor:
     """Serving hot-vocabulary list -> bool [vocab] mask for ``model.chain``."""
-    ids = torch.load(os.path.expanduser(path), map_location="cpu", weights_only=True)
+    ids = torch.load(input_path(path), map_location="cpu", weights_only=True)
     ids = torch.as_tensor(list(ids), dtype=torch.int64)
     if ids.numel() == 0:
         raise SystemExit(f"token map {path}: empty (it would forbid every draft token)")

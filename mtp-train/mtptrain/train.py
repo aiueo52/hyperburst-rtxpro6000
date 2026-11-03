@@ -93,6 +93,7 @@ A fresh run gets a ``run_id``.  It is stored in ``latest.pt``, in ``best``
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -126,6 +127,7 @@ from .fileio import (
 )
 from .loss import chunked_ce, chunked_mixed_ce, soft_targets_from_batch
 from .model import MTPHead
+from .paths import dump_input, dump_path, dump_root, input_path
 from .renewal import RenewalResult, renewal_evaluate
 from .rollout import chain_losses, step_weights
 from . import weights as W
@@ -312,15 +314,18 @@ def save_weights_bf16(path: str, model, metadata: Optional[dict] = None) -> None
     rename); ``metadata`` values are stored as strings in the file header,
     next to ``mtp_tensors_digest``, the digest of the tensors written (see
     ``tensors_digest``): what a header says about the file is only believed
-    for the content it was written with."""
+    for the content it was written with. After the atomic write completes,
+    release the snapshot's page cache with best-effort DONTNEED advice."""
     from safetensors.torch import save_file
 
     from .weights import export_state_dict
+    from .fileio import drop_page_cache
 
     state = export_state_dict(model)
     meta = {k: str(v) for k, v in (metadata or {}).items()}
     meta["mtp_tensors_digest"] = tensors_digest(state)
     write_atomic(path, lambda tmp: save_file(state, tmp, metadata=meta))
+    drop_page_cache(path)
 
 
 def tensors_digest(state: Dict[str, torch.Tensor]) -> str:
@@ -494,16 +499,16 @@ def selection_metrics(mode: str) -> List[str]:
 
 
 def load_eval_samples(args) -> List[Sample]:
-    """The fixed held-out subset, so every eval is comparable and takes minutes."""
+    """Fixed held-out subset confined to the caller's selected --dump-dir."""
     from .data import load_fixed_eval
 
     # An explicit --eval-set is used or the run refuses (validate_inputs checked
     # that it exists); only without one is the dump's held-out split scored.
     if args.eval_set:
-        # Which dump it came from does not matter; that its documents are not
-        # training documents is checked by content (check_train_eval_overlap).
-        path = os.path.expanduser(args.eval_set)
-        out = load_fixed_eval(path, max_rows=args.eval_rows or None)
+        # The caller selects the dump root; JSON provenance cannot authorize
+        # another root. Content and source keys still enforce held-out status.
+        path = dump_input(args.dump_dir, args.eval_set)
+        out = load_fixed_eval(path, max_rows=args.eval_rows or None, dump_dir=args.dump_dir)
         where = f"--eval-set {args.eval_set}"
     else:
         ds = DumpDataset(args.dump_dir, split="eval", holdout_frac=args.holdout,
@@ -521,13 +526,14 @@ def load_eval_samples(args) -> List[Sample]:
     return out
 
 
-def _manifest_keys(path: Optional[str]) -> Dict[str, set]:
-    """doc_hash -> every split key a manifest gives it ({} without a manifest)."""
+def _manifest_keys(path: Optional[str], dump_dir: str) -> Dict[str, set]:
+    """doc_hash -> split keys from a manifest confined to the selected dump."""
     from .fileio import read_jsonl
 
     out: Dict[str, set] = {}
+    path = dump_input(dump_dir, path) if path else None
     if path and os.path.isfile(path):
-        for r in read_jsonl(path):
+        for r in read_jsonl(dump_input(dump_dir, path)):
             out.setdefault(r["doc_hash"], set()).add(r.get("split_key") or r["doc_hash"])
     return out
 
@@ -537,22 +543,21 @@ def eval_identities(args, eval_samples, renewal_set) -> List[tuple]:
 
     The keys name the source documents; an empty set means the source's keys
     are unknown (an older eval set whose dump has no manifest), so only the
-    content hash can be checked.
+    content hash can be checked. Eval JSON and manifests stay within the
+    caller-selected eval or renewal dump root, never a root from metadata.
     """
     out = []
     if args.synthetic:
         out.append(("synthetic eval", {s.doc_hash: set() for s in eval_samples}))
     elif args.eval_set:
-        path = os.path.expanduser(args.eval_set)
-        with open(path) as fh:
+        with open(dump_input(args.dump_dir, args.eval_set)) as fh:
             data = json.load(fh)
         keys = {d["doc_hash"]: set(d["split_keys"]) for d in data.get("docs", [])
                 if d.get("split_keys")}
-        if len(keys) < len(eval_samples):  # an older eval set: ask its dump
-            for root in (data.get("dump_dir"), os.path.dirname(os.path.abspath(path))):
-                if root:
-                    for h, ks in _manifest_keys(os.path.join(root, "manifest.jsonl")).items():
-                        keys.setdefault(h, ks)
+        if len(keys) < len(eval_samples):  # an older eval set: ask the selected dump
+            manifest = dump_path(args.dump_dir, "manifest.jsonl")
+            for h, ks in _manifest_keys(manifest, args.dump_dir).items():
+                keys.setdefault(h, ks)
         out.append((f"--eval-set {args.eval_set}",
                     {s.doc_hash: keys.get(s.doc_hash, set()) for s in eval_samples}))
     else:
@@ -561,9 +566,9 @@ def eval_identities(args, eval_samples, renewal_set) -> List[tuple]:
         out.append(("the held-out split of --dump-dir",
                     {s.doc_hash: ds.keys_of(s.doc_hash) for s in eval_samples}))
     if renewal_set is not None:
-        src = args.renewal_dump_dir or args.dump_dir
-        keys = _manifest_keys(os.path.expanduser(
-            args.renewal_manifest or os.path.join(src, "manifest.jsonl")))
+        src = dump_root(args.renewal_dump_dir or args.dump_dir)
+        manifest = args.renewal_manifest or dump_path(src, "manifest.jsonl")
+        keys = _manifest_keys(manifest, src)
         out.append(("the renewal documents",
                     {s.doc_hash: keys.get(s.doc_hash, set()) for s in renewal_set.samples}))
     return out
@@ -575,7 +580,7 @@ def check_train_eval_overlap(train_ids: Dict[str, set], sources: List[tuple]) ->
     Checked by content (the doc_hash of the token ids) and by source document
     (the manifest's split keys: another window or re-chunking of a training
     document is not held out either).  Every eval source is checked: the
-    frozen eval set (which may come from another dump), the held-out split and
+    frozen eval set (within the selected dump root), the held-out split and
     the renewal documents.
     """
     train_keys = set().union(*train_ids.values()) if train_ids else set()
@@ -601,10 +606,10 @@ def check_train_eval_overlap(train_ids: Dict[str, set], sources: List[tuple]) ->
                            "--seed/--holdout, or train on a dump that excludes them")
 
 
-def _read_eval_set_header(path: str) -> dict:
-    """The eval set's JSON minus the per-document lists; SystemExit if unreadable."""
+def _read_eval_set_header(path: str, dump_dir: str) -> dict:
+    """Read an eval header within the selected dump; SystemExit if unreadable."""
     try:
-        with open(path) as fh:
+        with open(dump_input(dump_dir, path)) as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
         raise SystemExit(f"--eval-set {path}: not a readable eval set ({exc})")
@@ -622,7 +627,7 @@ def load_renewal_set(args):
     """
     from .select import load_selfgen_samples, select_selfgen_docs
 
-    dump_dir = args.renewal_dump_dir or args.dump_dir
+    dump_dir = dump_root(args.renewal_dump_dir or args.dump_dir)
     chosen, index = select_selfgen_docs(
         dump_dir,
         manifest=args.renewal_manifest,
@@ -636,7 +641,7 @@ def load_renewal_set(args):
         greedy_only=args.renewal_greedy_only,
     )
     sel = load_selfgen_samples(dump_dir, chosen, index, max_len=args.renewal_max_len)
-    if not len(sel):
+    if not len(sel) and not args.allow_missing_renewal:
         raise SystemExit(
             f"--eval-renewal: no held-out self-generated document in {dump_dir} "
             f"(buckets={args.renewal_buckets or 'all'}, min_gen={args.renewal_min_gen}, "
@@ -654,7 +659,13 @@ def load_renewal_set(args):
 def run_renewal(model, args, sel, allowed=None) -> dict:
     """-> {accept_len@k, verifies@k, renewal_mean, renewal_by_bucket}."""
     if sel is None or not len(sel):
-        return {}
+        if not args.eval_renewal:
+            return {}
+        out = {"renewal_mean": None}
+        for k in args.renewal_ks:
+            out[f"accept_len@{k}"] = None
+            out[f"verifies@{k}"] = 0
+        return out
     t0 = time.time()
     results = renewal_evaluate(
         model, sel.samples, sel.gen_start_rows, ks=tuple(args.renewal_ks),
@@ -666,7 +677,8 @@ def run_renewal(model, args, sel, allowed=None) -> dict:
     for k, res in sorted(results.items()):
         summary = res.summary()
         al = summary["accept_len"]  # None when no verify was simulated
-        out[f"accept_len@{k}"] = None if al is None else round(al, 5)
+        # Retain full precision: rounding here can flip a strict 1% gate.
+        out[f"accept_len@{k}"] = al
         out[f"verifies@{k}"] = summary["verifies"]
         lens.append(al)
         per_bucket: dict = {}
@@ -762,8 +774,8 @@ def validate_inputs(args) -> None:
             errs.append("--eval-set is not used with --synthetic")
         if args.exclude_buckets:
             errs.append("--exclude-buckets is not used with --synthetic")
-    if args.eval_set and need("--eval-set", args.eval_set, "file"):
-        head = _read_eval_set_header(os.path.expanduser(args.eval_set))
+    if args.eval_set and need("--eval-set", args.eval_set, "file") and dump_ok:
+        head = _read_eval_set_header(args.eval_set, args.dump_dir)
         for key, opt in (("holdout", "--holdout"), ("seed", "--seed")):
             want = getattr(args, key)
             if key in head and head[key] != want:
@@ -774,6 +786,16 @@ def validate_inputs(args) -> None:
         if need("--model-dir", args.model_dir, "dir"):
             need("--model-dir config.json", os.path.join(args.model_dir, "config.json"),
                  "file")
+    if args.allow_missing_renewal and not args.eval_renewal:
+        errs.append("--allow-missing-renewal needs --eval-renewal")
+    if not math.isfinite(args.time_limit_seconds) or args.time_limit_seconds < 0:
+        errs.append("--time-limit-seconds must be finite and >= 0")
+    if args.snapshot_keep < 0:
+        errs.append("--snapshot-keep must be >= 0")
+    if args.no_latest and args.resume:
+        errs.append("--no-latest cannot be combined with --resume")
+    if args.eval_original_and_best and (not args.out or not args.eval_every or args.resume or args.init):
+        errs.append("--eval-original-and-best needs --out, --eval-every and a fresh original head")
     if args.init:
         need("--init", args.init, "file")
         if args.tiny:
@@ -972,11 +994,21 @@ def comparison_record(args, eval_samples, renewal_set, tap_layers,
                                    + list(renewal_set.buckets)),
         }
     if args.token_map:
-        rec["token_map"] = file_digest(os.path.expanduser(args.token_map))
+        rec["token_map"] = file_digest(str(input_path(args.token_map)))
+        rec["token_map_sha256"] = token_map_sha256(args.token_map)
     if args.init:
         rec["init"] = {"path": os.path.abspath(os.path.expanduser(args.init)),
                        "digest": file_digest(os.path.expanduser(args.init))}
     return rec
+
+
+def token_map_sha256(path: str) -> str:
+    """Uncached content binding for the serving vocabulary used by renewal."""
+    digest = hashlib.sha256()
+    with input_path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 # Provenance only: --init is refused together with --resume, so a resumed run
@@ -992,7 +1024,8 @@ def compare_records(old: dict, new: dict) -> dict:
 
 # Files ``train`` writes into --out (plus mtp-step{N}.safetensors snapshots).
 OUT_FILES = ("latest.pt", "best-mtp.safetensors", "best.json", "history.json",
-             "final-mtp.safetensors")
+             "final-mtp.safetensors", "original-eval.json", "best-eval.json",
+             "termination.json")
 
 
 def _is_snapshot(name: str) -> bool:
@@ -1158,9 +1191,11 @@ class SimulatedCrash(RuntimeError):
     """Raised by the ``_crash_after_step`` test hook of ``train``."""
 
 
-def train(args, _crash_after_step: Optional[int] = None) -> dict:
+def train(args, _crash_after_step: Optional[int] = None, _clock=None) -> dict:
     """``_crash_after_step`` (tests only) aborts right after that optimizer
     step and its eval/checkpoint, like a process killed at that point."""
+    clock = _clock or time.monotonic
+    started = clock()
     validate_inputs(args)  # as given, before defaults are filled in
     args = resolve_args(args)
     check_select_metric(args)
@@ -1219,6 +1254,7 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
     if args.token_map:
         from .select import load_token_map
 
+        map_sha256 = token_map_sha256(args.token_map)
         allowed = load_token_map(args.token_map, int(model.lm_head.shape[0])).to(device)
         print(f"[token-map] {int(allowed.sum())} allowed draft ids")
 
@@ -1227,6 +1263,8 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
         check_metric_measurable(args, eval_samples)
     record = comparison_record(args, eval_samples, renewal_set,
                                model.config.tap_layers, model.base_digest, model.config)
+    if args.token_map and record["token_map_sha256"] != map_sha256:
+        raise SystemExit("--token-map changed while loading; refusing incomparable evaluation")
 
     run_id = uuid.uuid4().hex  # replaced by the checkpoint's on --resume
     start_step = 0
@@ -1319,6 +1357,45 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
     best["run_id"] = run_id
     best["compare"] = record
     epochs_this_run = 0
+    timed_out = False
+
+    def expired():
+        return bool(args.time_limit_seconds and clock() - started >= args.time_limit_seconds)
+
+    def evaluate_and_select():
+        summary = run_eval(model, args, eval_samples)
+        summary.update(run_renewal(model, args, renewal_set, allowed))
+        print(f"EVAL step {step} {json.dumps(summary)}", flush=True)
+        entry = {"step": step, "eval": summary}
+        history.append(entry)
+        primary, score = selection_score(summary, args.select_metric)
+        if score is None or not math.isfinite(score):
+            entry["unscored"] = [m for m in selection_metrics(primary)
+                                 if summary.get(m) is None or not math.isfinite(summary[m])]
+            print(f"[eval] WARNING step {step}: selection metric unmeasured", flush=True)
+        elif args.out and score > best["score"]:
+            best.update(score=score, step=step, summary=summary, criterion=primary)
+            save_weights_bf16(
+                os.path.join(args.out, "best-mtp.safetensors"), model,
+                metadata={"mtp_best": json.dumps(best), "mtp_run_id": run_id,
+                          "mtp_step": step},
+            )
+            write_json_atomic(os.path.join(args.out, "best.json"), best)
+            print(f"BEST step {step} {primary}={score:.5f}", flush=True)
+        if args.out and args.snapshot_every_eval and step > 0:
+            # Prune only replaceable periodic snapshots, never the selected best.
+            snapshots = sorted(
+                (n for n in os.listdir(args.out) if _is_snapshot(n)),
+                key=lambda n: int(n[len("mtp-step"):-len(".safetensors")]),
+            )
+            if args.snapshot_keep:
+                for name in snapshots[:max(0, len(snapshots) - args.snapshot_keep + 1)]:
+                    os.unlink(os.path.join(args.out, name))
+            save_weights_bf16(
+                os.path.join(args.out, f"mtp-step{step}.safetensors"), model,
+                metadata={"mtp_run_id": run_id, "mtp_step": step},
+            )
+        return summary
 
     def make_stream(epoch: int):
         if args.synthetic:
@@ -1326,14 +1403,35 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
         return train_dataset(args).shuffled(seed=args.seed + epoch)
 
     def checkpoint(epoch_done: int, batches: int) -> None:
-        save_checkpoint(
-            os.path.join(args.out, "latest.pt"), model, optimizer, step,
-            {"args": vars(args), "compare": record, "train_docs": train_digest},
-            epoch=epoch_done, best=best, history=history,
-            epoch_batches=batches, accum=accum, tokens_seen=tokens_seen,
-            run_id=run_id,
-        )
+        if not args.no_latest:
+            save_checkpoint(
+                os.path.join(args.out, "latest.pt"), model, optimizer, step,
+                {"args": vars(args), "compare": record, "train_docs": train_digest},
+                epoch=epoch_done, best=best, history=history,
+                epoch_batches=batches, accum=accum, tokens_seen=tokens_seen,
+                run_id=run_id,
+            )
         write_json_atomic(os.path.join(args.out, "history.json"), history)
+
+    if args.eval_original_and_best:
+        summary = evaluate_and_select()
+        if best["step"] < 0:
+            # Keep the original as an explicitly UNSCORED fallback, not a
+            # renewal-selected improvement. A missing metric never passes a gate.
+            best.update(step=0, summary=summary, criterion="unscored", unscored=True)
+            save_weights_bf16(
+                os.path.join(args.out, "best-mtp.safetensors"), model,
+                metadata={"mtp_best": json.dumps(best), "mtp_run_id": run_id,
+                          "mtp_step": 0},
+            )
+            write_json_atomic(os.path.join(args.out, "best.json"), best)
+        write_json_atomic(os.path.join(args.out, "original-eval.json"),
+                          {"summary": summary, "compare": record, "run_id": run_id,
+                           "step": 0})
+        # Unless disabled, persist an initial restart point too. The original
+        # best survives a hard timeout even when --no-latest omits optimizer state.
+        checkpoint(start_epoch, skip_batches)
+        stop = timed_out = expired()
 
     # (completed epochs, micro-batches of the current one) for the final save
     position = (start_epoch, skip_batches)
@@ -1356,7 +1454,8 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
         loader = PrefetchLoader(groups, depth=args.prefetch)
         try:
             for batch in loader:
-                if step >= args.steps:
+                if step >= args.steps or expired():
+                    timed_out = expired()
                     stop = True
                     break
                 epoch_batches += 1
@@ -1479,48 +1578,10 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
                     )
                     history.append(rec)
 
-                if args.eval_every and step % args.eval_every == 0:
-                    summary = run_eval(model, args, eval_samples)
-                    summary.update(run_renewal(model, args, renewal_set, allowed))
-                    print(f"EVAL step {step} {json.dumps(summary)}", flush=True)
-                    entry = {"step": step, "eval": summary}
-                    history.append(entry)
-                    # Select on accept@k, not agreement@1: the two can diverge once
-                    # the head's distribution shifts, and acceptance is the goal.
-                    # agreement@1 breaks ties (accept@k has far fewer windows).
-                    primary, score = selection_score(summary, args.select_metric)
-                    if score is None:
-                        # Unmeasured is not zero: this eval neither becomes the
-                        # best nor is compared with it.
-                        missing = [m for m in selection_metrics(primary)
-                                   if summary.get(m) is None]
-                        entry["unscored"] = missing
-                        print(f"[eval] WARNING step {step}: {', '.join(missing)} not "
-                              f"measured (no scorable window/verify); --select-metric "
-                              f"{primary} skips this eval", flush=True)
-                    elif args.out and score > best["score"]:
-                        best.update(score=score, step=step, summary=summary,
-                                    criterion=primary)
-                        # The weights carry their own best entry, so a resume
-                        # knows about this one even if it postdates latest.pt.
-                        save_weights_bf16(
-                            os.path.join(args.out, "best-mtp.safetensors"), model,
-                            metadata={"mtp_best": json.dumps(best), "mtp_run_id": run_id,
-                                      "mtp_step": step},
-                        )
-                        write_json_atomic(os.path.join(args.out, "best.json"), best)
-                        shown = " ".join(
-                            f"{m} {_fmt_metric(summary.get(m))}"
-                            for m in ("accept_len@3", "accept_len@15", "accept@3",
-                                      "accept@15", "agreement@1") if m in summary)
-                        print(f"BEST step {step} {primary}={score:.5f} ({shown})",
-                              flush=True)
-                    if args.out and args.snapshot_every_eval:
-                        # Keep every eval's weights so an A/B needs no retraining.
-                        save_weights_bf16(
-                            os.path.join(args.out, f"mtp-step{step}.safetensors"), model,
-                            metadata={"mtp_run_id": run_id, "mtp_step": step},
-                        )
+                # Do not start an expensive eval after the budget is exhausted;
+                # an already selected best remains intact.
+                if args.eval_every and step % args.eval_every == 0 and not expired():
+                    evaluate_and_select()
 
                 if args.ckpt_every and step % args.ckpt_every == 0 and args.out:
                     checkpoint(epoch, epoch_batches)
@@ -1548,11 +1609,36 @@ def train(args, _crash_after_step: Optional[int] = None) -> dict:
 
     if args.out:
         os.makedirs(args.out, exist_ok=True)
+        # A short run may end before its next scheduled eval. Evaluate that
+        # candidate only while there is budget; otherwise keep the earlier best.
+        if (args.eval_original_and_best and not expired()
+                and not any(h.get("step") == step and "eval" in h for h in history)):
+            evaluate_and_select()
         checkpoint(*position)
-        save_weights_bf16(os.path.join(args.out, "final-mtp.safetensors"), model,
-                          metadata={"mtp_run_id": run_id, "mtp_step": step})
+        if not args.no_final_weights:
+            save_weights_bf16(os.path.join(args.out, "final-mtp.safetensors"), model,
+                              metadata={"mtp_run_id": run_id, "mtp_step": step})
+        if args.eval_original_and_best and best["step"] >= 0:
+            # Score the actual BF16 export, not the pre-rounding FP32 master.
+            from safetensors.torch import load_file
+
+            path = os.path.join(args.out, "best-mtp.safetensors")
+            state = {k[len("mtp."):]: v for k, v in load_file(path).items()}
+            model.load_state_dict(state, strict=True)
+            del state
+            summary = run_eval(model, args, eval_samples)
+            summary.update(run_renewal(model, args, renewal_set, allowed))
+            write_json_atomic(os.path.join(args.out, "best-eval.json"),
+                              {"summary": summary, "compare": record, "run_id": run_id,
+                               "step": best["step"], "checkpoint_digest": file_digest(path)})
+        timed_out = timed_out or expired()
+        write_json_atomic(os.path.join(args.out, "termination.json"),
+                          {"steps": step, "time_limit_reached": timed_out,
+                           "elapsed_seconds": clock() - started,
+                           "time_limit_seconds": args.time_limit_seconds})
     return {"steps": step, "history": history, "best": best, "run_id": run_id,
-            "epoch": position[0], "epoch_batches": position[1]}
+            "epoch": position[0], "epoch_batches": position[1],
+            "time_limit_reached": timed_out}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1563,6 +1649,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="serving checkpoint (env MTP_MODEL_DIR)")
     p.add_argument("--dump-dir", default=None)
     p.add_argument("--out", default=None)
+    p.add_argument("--time-limit-seconds", type=float, default=0,
+                   help="cooperative wall-clock budget including input loading; 0 = unlimited")
+    p.add_argument("--eval-original-and-best", action="store_true",
+                   help="evaluate original before training and BF16 best export afterwards")
+    p.add_argument("--allow-missing-renewal", action="store_true",
+                   help="record null/zero verifies instead of refusing an empty renewal split")
+    p.add_argument("--snapshot-keep", type=int, default=0,
+                   help="maximum periodic snapshots, excluding best; 0 = unlimited")
+    p.add_argument("--no-final-weights", action="store_true",
+                   help="omit the redundant final BF16 export")
+    p.add_argument("--no-latest", action="store_true",
+                   help="omit all full optimizer checkpoints (not combinable with --resume)")
     p.add_argument("--resume", default=None,
                    help="latest.pt to continue from (must exist).  Restores the "
                         "model, optimizer, step, epoch and position inside it, "
@@ -1603,8 +1701,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "with the exact data order an uninterrupted run would "
                         "have had (0 = run to --steps)")
     p.add_argument("--eval-set", default=None,
-                   help="fixed eval index from build_eval_set.py (must exist; "
-                        "without it the dump's held-out split is scored)")
+                   help="fixed eval index from build_eval_set.py (must exist within "
+                        "--dump-dir, as must its shards; without it the dump's "
+                        "held-out split is scored)")
     p.add_argument("--eval-rows", type=int, default=0,
                    help="0 = the whole frozen eval set, matching the baseline")
     p.add_argument("--eval-batch", type=int, default=8)

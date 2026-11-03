@@ -82,8 +82,8 @@ def load_shared_heads(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """(embed_tokens, lm_head).
 
-    Both live BF16 inside the NVFP4 serving checkpoint (they are on the
-    quantizer's ignore list), so the 131-shard BF16 mirror is not needed.
+    Both live BF16 inside the same serving checkpoint as ``mtp.*`` (they
+    are on the quantizer's ignore list).
     """
     raw = _load_from_shards(model_dir, [EMBED_KEY, LM_HEAD_KEY], device=device)
     return raw[EMBED_KEY], raw[LM_HEAD_KEY]
@@ -110,6 +110,12 @@ def load_into(
     if missing or unexpected:
         raise RuntimeError(f"MTP load mismatch: missing={missing} unexpected={unexpected}")
     embed, lm_head = load_shared_heads(model_dir, device=device)
+    expected_shape = (model.config.vocab_size, model.config.hidden_size)
+    for name, tensor in ((EMBED_KEY, embed), (LM_HEAD_KEY, lm_head)):
+        if tensor.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be an original BF16 tensor")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(f"{name} has shape {tuple(tensor.shape)}, expected {expected_shape}")
     model.set_frozen_heads(embed.to(head_dtype), lm_head.to(head_dtype))
     return sorted(state)
 

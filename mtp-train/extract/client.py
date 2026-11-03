@@ -64,6 +64,7 @@ if REPO not in sys.path:
 from corpus import formats as F  # noqa: E402
 from mtptrain.cli import StrictParser, split_list  # noqa: E402
 from mtptrain.config import DEFAULT_MODEL_DIR  # noqa: E402
+from mtptrain.paths import input_path  # noqa: E402
 from mtptrain.fileio import (  # noqa: E402
     check_run_settings,
     open_jsonl_append,
@@ -391,10 +392,10 @@ def filter_docs(docs, lang=None, workload=None):
 def load_jsonl_docs(paths: Sequence[str], text_key: str = "text"):
     out = []
     for path in paths:
-        if not os.path.isfile(os.path.expanduser(path)):
+        if not input_path(path).is_file():
             raise SystemExit(f"--jsonl {path}: no such file")
         before = len(out)
-        with open(os.path.expanduser(path), "r", encoding="utf-8",
+        with open(input_path(path), "r", encoding="utf-8",
                   errors="replace") as handle:
             for i, line in enumerate(handle):
                 line = line.strip()
@@ -639,7 +640,7 @@ def check_inputs(args, docs) -> None:
                 f"({other['source']}:{other['name']} and {d['source']}:{d['name']}); "
                 "give the sources distinct NAME= labels or file names")
     sources = {d["source"] for d in docs}
-    rows = [r for r in read_jsonl(args.manifest, missing_ok=True)
+    rows = [r for r in read_jsonl(input_path(args.manifest), missing_ok=True)
             if r.get("mode") in ("corpus", "selfgen")]
     legacy = [r for r in rows if "input_hash" not in r]
     if legacy:
@@ -677,7 +678,7 @@ def finish(state: dict, what: str) -> None:
 
 def resume_state(args) -> Tuple[set, set, int]:
     """-> (doc_hashes, split_keys, tokens) already recorded for this mode/bucket."""
-    rows = read_jsonl(args.manifest, missing_ok=True)
+    rows = read_jsonl(input_path(args.manifest), missing_ok=True)
     dry = [r for r in rows if r.get("dry_run")]
     if dry and not args.dry_run:
         raise SystemExit(f"{args.manifest} holds {len(dry)} --dry-run rows; "
@@ -705,7 +706,7 @@ def run_extract(args) -> None:
     lock = threading.Lock()
     done, _keys, used = resume_state(args)
     state = {"tokens": used, "chunks": 0, "docs": 0, "errors": 0, "skipped": 0}
-    manifest = open_jsonl_append(args.manifest)
+    manifest = open_jsonl_append(str(input_path(args.manifest)))
     t0 = time.time()
 
     def handle(doc) -> None:
@@ -786,7 +787,7 @@ def run_selfgen(args) -> None:
     done_hashes, done_keys, used = resume_state(args)
     state = {"tokens": used, "docs": 0, "errors": 0, "skipped": 0, "no_prompt": 0,
              "short": 0, "duplicate": 0}
-    manifest = open_jsonl_append(args.manifest)
+    manifest = open_jsonl_append(str(input_path(args.manifest)))
     t0 = time.time()
 
     def handle(doc) -> None:

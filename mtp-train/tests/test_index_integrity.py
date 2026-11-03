@@ -151,10 +151,14 @@ def test_retargeted_symlink_makes_the_index_stale():
         _fixture(src)
         view = os.path.join(tmp, "view")
         os.makedirs(view)
-        os.symlink(os.path.join(src, LAST), os.path.join(view, LAST))
+        targets = os.path.join(view, "targets")
+        os.makedirs(targets)
+        first = os.path.join(targets, "first")
+        shutil.copy2(os.path.join(src, LAST), first)
+        os.symlink(first, os.path.join(view, LAST))
         load_index(view)
-        other = os.path.join(tmp, "other.safetensors")
-        shutil.copy2(os.path.join(src, LAST), other)  # same size and mtime
+        other = os.path.join(targets, "other")
+        shutil.copy2(first, other)  # same size and mtime
         os.remove(os.path.join(view, LAST))
         os.symlink(other, os.path.join(view, LAST))
         assert not is_current(view)

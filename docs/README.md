@@ -9,6 +9,7 @@
 | [`timeline.md`](timeline.md) | dated record, 2026-08-28 to 2026-10-02 |
 | [`reproduce.md`](reproduce.md) | how to rebuild the stack and re-run the benchmarks |
 | [`train-your-own-mtp-head.md`](train-your-own-mtp-head.md) | fine-tune the MTP draft head on your own data: dump hook, corpus, self-generation, training recipe, renewal evaluation, write-back, server A/B |
+| [`public-data-mtp-head.md`](public-data-mtp-head.md) | retrain the MTP draft head on public data only: prompt set, generation, extraction, training, offline gate, one server A/B result and its deviations (no weights) |
 | [`lab-notes/`](lab-notes/) | the original engineering notes, lightly sanitised (paths; all results of evaluations on private data removed) |
 
 The first five pages were written after the fact from the project log and the lab notes. Numbers that

@@ -28,6 +28,7 @@ import torch  # noqa: E402
 
 from mtptrain.cli import StrictParser  # noqa: E402
 from mtptrain.fileio import read_jsonl  # noqa: E402
+from mtptrain.paths import dump_path, dump_root  # noqa: E402
 from mtptrain.dumpindex import (  # noqa: E402
     document_hash,
     documents,
@@ -37,12 +38,10 @@ from mtptrain.dumpindex import (  # noqa: E402
 
 
 def verify(dump: str, docs: int = 200, greedy_only: bool = True) -> dict:
-    d = os.path.expanduser(dump)
-    if not os.path.isdir(d):
-        raise SystemExit(f"{dump}: no such directory")
+    d = dump_root(dump)
     if docs < 1:
         raise SystemExit("--docs must be >= 1")
-    man = read_jsonl(os.path.join(d, "manifest.jsonl"))  # must exist
+    man = read_jsonl(dump_path(d, "manifest.jsonl"))  # must exist
     by_hash = {r["doc_hash"]: r for r in man}
     want = {h: r for h, r in by_hash.items()
             if "prompt_tokens" in r

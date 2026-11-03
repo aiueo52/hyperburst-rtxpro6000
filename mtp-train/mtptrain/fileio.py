@@ -36,6 +36,27 @@ def fsync_dir(path: str) -> None:
         os.close(fd)
 
 
+def drop_page_cache(path: str) -> None:
+    """Flush a completed snapshot, then advise DONTNEED without following links.
+
+    Advice is best effort: an unsupported filesystem or a vanished snapshot
+    must not turn a successfully saved training checkpoint into a failure.
+    """
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except (OSError, AttributeError, ValueError):
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def fsync_file(path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -335,6 +356,7 @@ def digest_parts(parts: Iterable) -> str:
 
 __all__ = [
     "JsonlAppender",
+    "drop_page_cache",
     "digest_parts",
     "check_run_settings",
     "digest_cache_path",

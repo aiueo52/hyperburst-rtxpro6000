@@ -462,7 +462,8 @@ This section concerns the historical September and 2026-10-02 configurations, no
   one. Measured together (original head + public map, 2026-10-06), `wa` was about 20 % slower on code-edit
   and 8–15 % slower on prose and agent-loop than with the private pair (table in the 2026-10 update). Or build your own token map from text you may use (`tokenmaps/README.md`),
   and train your own head on your own data with [`docs/train-your-own-mtp-head.md`](docs/train-your-own-mtp-head.md)
-  (code in [`mtp-train/`](mtp-train/)).
+  (code in [`mtp-train/`](mtp-train/)). A recipe that retrains the head on public data only, with the
+  result of one run and no weights, is in [`docs/public-data-mtp-head.md`](docs/public-data-mtp-head.md).
 - **Workloads are narrow.** The headline table uses one prompt per workload; code-edit is an extremely
   repetitive mechanical edit where wide speculation shines (11.9 tokens accepted per step). The
   8-prompt table is the fairer summary. Thinking is on, so most counted tokens are reasoning text.
@@ -506,7 +507,7 @@ This section concerns the historical September and 2026-10-02 configurations, no
 | `kernels/` | readable snapshots of our Triton kernels + micro-benchmarks |
 | `sim/` | offline n-gram acceptance simulator (no corpora) |
 | `tokenmaps/` | how to build a reduced draft vocabulary; historical scripts in `as-used/`; `public/` = 49,152- and 32,768-token maps built only from public data, their source records and preparation scripts (both maps and both source records CC BY-SA 4.0, scripts Apache-2.0); rebuild with `build_hot_vocab.py` |
-| `mtp-train/` | MTP draft-head fine-tuning pipeline: dump client, corpus readers, self-generation, trainer, renewal evaluator, write-back (no data or weights) |
+| `mtp-train/` | MTP draft-head fine-tuning pipeline: dump client, corpus readers, self-generation, trainer, renewal evaluator, write-back (no data or weights); `recipes/public-data/` retrains the head on public data only |
 | `docs/` | optimisations, rejected experiments, roofline, measurement method, timeline, reproduction; `lab-notes/` = the original engineering logs |
 
 ## Licence and credits

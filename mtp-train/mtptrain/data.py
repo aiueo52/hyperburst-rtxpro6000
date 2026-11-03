@@ -46,6 +46,8 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 import torch
 
+from .paths import dump_input, dump_path, dump_root, input_path
+
 
 @dataclass
 class Sample:
@@ -153,11 +155,16 @@ def is_holdout_key(key: str, seed: int, holdout_frac: float) -> bool:
 
 
 def iter_dump_files(dump_dir: str) -> List[str]:
+    dump_dir = dump_root(dump_dir)
     files = []
-    for root, _dirs, names in os.walk(dump_dir):
+    for root, dirs, names in os.walk(dump_dir):
+        for name in dirs:
+            dump_path(dump_dir, os.path.relpath(os.path.join(root, name), dump_dir))
         for name in sorted(names):
             if name.endswith(".safetensors"):
-                files.append(os.path.join(root, name))
+                path = os.path.join(root, name)
+                dump_path(dump_dir, os.path.relpath(path, dump_dir))
+                files.append(path)
     return sorted(files)
 
 
@@ -170,7 +177,7 @@ def read_tap_layers(dump_dir: str) -> tuple:
     from safetensors import safe_open
 
     for path in iter_dump_files(dump_dir):
-        with safe_open(path, framework="pt", device="cpu") as f:
+        with safe_open(dump_input(dump_dir, path), framework="pt", device="cpu") as f:
             meta = f.metadata() or {}
             if "tap_hidden" not in f.keys():
                 return ()
@@ -180,11 +187,14 @@ def read_tap_layers(dump_dir: str) -> tuple:
 
 
 def load_dump_file(
-    path: str, min_len: int = 8, vocab_size: int = 248320
+    path: str, min_len: int = 8, vocab_size: int = 248320, *,
+    dump_dir: Optional[str] = None,
 ) -> List[Sample]:
     from safetensors import safe_open
 
     out: List[Sample] = []
+    root = dump_dir if dump_dir is not None else os.path.dirname(os.path.abspath(path))
+    path = dump_input(root, path)
     with safe_open(path, framework="pt", device="cpu") as f:
         keys = set(f.keys())
         ids = f.get_tensor("input_ids").to(torch.int64)
@@ -241,15 +251,23 @@ def load_dump_file(
     return out
 
 
-def load_concat(paths: Sequence[str], seqs: Sequence[int]) -> Sample:
+def load_concat(paths: Sequence[str], seqs: Sequence[int], *,
+                dump_dir: Optional[str] = None) -> Sample:
     """One Sample from consecutive chunked-prefill dump files of one request
     (positions continue across files; the last file may be short)."""
     from safetensors import safe_open
 
+    if not paths or len(paths) != len(seqs):
+        raise ValueError("dump pieces and sequence slots must be nonempty and aligned")
+    root = dump_root(dump_dir if dump_dir is not None
+                     else os.path.dirname(os.path.abspath(paths[0])))
+    paths = [dump_input(root, p) for p in paths]
+    if any(type(s) is not int or s < 0 for s in seqs):
+        raise ValueError("invalid dump sequence slot")
     ids, hc, pos, tgt, tap = [], [], [], [], []
     s_ids, s_logits, s_lse = [], [], []
     for path, s in zip(paths, seqs):
-        with safe_open(path, framework="pt", device="cpu") as f:
+        with safe_open(dump_input(root, path), framework="pt", device="cpu") as f:
             keys = set(f.keys())
             offs = f.get_tensor("seq_offsets").tolist() if "seq_offsets" in keys else None
             a, b = (int(offs[s]), int(offs[s + 1])) if offs else (0, None)
@@ -320,8 +338,7 @@ class DumpDataset:
         exclude_buckets: Optional[Sequence[str]] = None,
         include_buckets: Optional[Sequence[str]] = None,
     ):
-        if not os.path.isdir(os.path.expanduser(dump_dir)):
-            raise SystemExit(f"dump dir {dump_dir!r}: no such directory")
+        dump_dir = dump_root(dump_dir)
         self.dump_dir = dump_dir
         self.stats: collections.Counter = collections.Counter()
         self.split = split
@@ -356,15 +373,17 @@ class DumpDataset:
         # data.  A manifest that exists but lists nothing (or nothing that is
         # on disk) selects nothing -- it never means "use every file".
         if manifest is None:
-            default = os.path.join(dump_dir, "manifest.jsonl")
+            default = dump_path(dump_dir, "manifest.jsonl")
             manifest = default if os.path.exists(default) else None
-        elif not os.path.isfile(os.path.expanduser(manifest)):
-            raise SystemExit(f"manifest {manifest!r}: no such file")
+        else:
+            manifest = dump_input(dump_dir, manifest)
+            if not os.path.isfile(manifest):
+                raise SystemExit(f"manifest {manifest!r}: no such file")
         self.manifest = manifest
         if manifest:
             from .fileio import read_jsonl  # tolerates a crash-truncated last line
 
-            for rec in read_jsonl(manifest):
+            for rec in read_jsonl(dump_input(dump_dir, manifest)):
                 key = rec.get("split_key") or rec.get("doc_hash")
                 self.split_keys.setdefault(rec["doc_hash"], key)
                 self.doc_keys[rec["doc_hash"]].add(key)
@@ -688,45 +707,40 @@ class PrefetchLoader:
         return False
 
 
-def load_fixed_eval(index_path: str, max_rows: Optional[int] = None) -> List[Sample]:
-    """Load the frozen held-out subset built by extract/build_eval_set.py.
+def load_fixed_eval(index_path: str, max_rows: Optional[int] = None, *,
+                    dump_dir: Optional[str] = None) -> List[Sample]:
+    """Load a frozen eval from its directory, or an explicitly selected dump.
 
-    The index names only the files that actually contain eval sequences, so an
-    eval pass reads a small fraction of the dump instead of all of it.
-
-    The eval set is a pointer into one dump directory.  Its pieces are
-    resolved against the recorded ``dump_dir``, or -- if the dump was moved --
-    against the directory holding the eval set (its default location).  A
-    piece that is missing or a document whose ids no longer hash to the
-    recorded doc_hash is an error: silently scoring a smaller or different set
-    would make evals incomparable.  Rebuild it with extract/build_eval_set.py.
+    The JSON's ``dump_dir`` is provenance, not permission to read another
+    root. Relative pieces keep working when a dump is moved. Legacy absolute
+    file lists are accepted only within the selected root. Missing or changed
+    documents remain errors rather than silently shrinking the evaluation.
     """
-    with open(index_path) as handle:
+    index_path = str(input_path(index_path))
+    root = dump_root(dump_dir if dump_dir is not None else os.path.dirname(index_path))
+    with open(dump_input(root, index_path)) as handle:
         index = json.load(handle)
+    if index.get("dump_dir"):
+        # Validate even stale provenance for private symlink hops, but never
+        # use it as a fallback root. Only the caller can approve another root.
+        input_path(index["dump_dir"])
     out: List[Sample] = []
     rows = 0
     if "docs" in index:
-        # Current format: every document with its pieces, so a request that
-        # chunked prefill split over several files is loaded joined.
         docs = index["docs"]
-        root = None
-        if docs and "pieces" in docs[0]:
-            for cand in (index.get("dump_dir"), os.path.dirname(os.path.abspath(index_path))):
-                if cand and all(os.path.exists(os.path.join(cand, p))
-                                for p in docs[0]["pieces"]):
-                    root = cand
-                    break
-            if root is None:
-                raise SystemExit(f"{index_path}: its dump ({index.get('dump_dir')}) is "
-                                 "not there any more; rebuild the eval set")
+        resolved = []
         for doc in docs:
-            files = ([os.path.join(root, p) for p in doc["pieces"]] if root is not None
-                     else doc["files"])
+            names = doc["pieces"] if "pieces" in doc else doc["files"]
+            if not isinstance(names, list) or not names:
+                raise ValueError("eval document needs a nonempty file list")
+            resolve = dump_path if "pieces" in doc else dump_input
+            resolved.append([resolve(root, p) for p in names])
+        for doc, files in zip(docs, resolved):
             missing = [p for p in files if not os.path.exists(p)]
             if missing:
                 raise SystemExit(f"{index_path}: eval document {doc['doc_hash']} lost "
                                  f"{missing[0]}; rebuild the eval set")
-            sample = load_concat(files, doc["seqs"])
+            sample = load_concat(files, doc["seqs"], dump_dir=root)
             if sample.doc_hash != doc["doc_hash"]:
                 raise SystemExit(f"{index_path}: eval document {doc['doc_hash']} changed "
                                  f"on disk (ids now hash to {sample.doc_hash}); rebuild "
@@ -736,16 +750,18 @@ def load_fixed_eval(index_path: str, max_rows: Optional[int] = None) -> List[Sam
             if max_rows and rows >= max_rows:
                 return out
         return out
-    # Older eval sets list files and hashes only (single-file documents).  The
-    # same rule: a lost file or document is an error, not a smaller eval set.
+    # Older eval sets list files and hashes only (single-file documents).
     wanted = set(index["doc_hashes"])
-    missing = [p for p in index["files"] if not os.path.exists(p)]
+    if not isinstance(index["files"], list):
+        raise ValueError("eval files must be a list")
+    files = [dump_input(root, p) for p in index["files"]]
+    missing = [p for p in files if not os.path.exists(p)]
     if missing:
         raise SystemExit(f"{index_path}: eval file {missing[0]} is gone "
                          f"({len(missing)} missing); rebuild the eval set")
     found = set()
-    for path in index["files"]:
-        for sample in load_dump_file(path):
+    for path in files:
+        for sample in load_dump_file(path, dump_dir=root):
             if sample.doc_hash not in wanted:
                 continue
             found.add(sample.doc_hash)
@@ -763,7 +779,7 @@ def write_manifest(path: str, records: Sequence[dict]) -> None:
     """Append rows (one flushed line each; a partial last line is repaired first)."""
     from .fileio import open_jsonl_append
 
-    with open_jsonl_append(path) as handle:
+    with open_jsonl_append(str(input_path(path))) as handle:
         for record in records:
             handle.write(record)
 
