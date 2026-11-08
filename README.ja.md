@@ -238,6 +238,25 @@ Tactic rows は、行数に応じて MoE GEMM の計算方法を選ぶ仕組み�
 - [bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4/tree/df3922b21fc28a8604cc9b31451495690d155194) (revision `df3922b`): LICENSE ファイルは Qwen Community License 1.0 で、一部の商用利用に条件があります。
 - [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/tree/7b719225242aacd3dbd3f9407468c2ee9a9d2594) (revision `7b71922`): カードのライセンス欄は `other` で、条件は元のモデルを参照するように記載されています。
 
+## 2026 年 11 月 8 日の束 2 公開準備
+
+束 2 は、フォークの `serve-fast.sh` に H35a(draft の step の確信度の融合)と
+H38(MTP FC の GEMV)の既定値を加え、VT の小さい M 向け MoE 前処理に H40 の patch を加えます。
+測定値は 431.0 → 443.6 tok/s、+2.91% で、表現は「約 +3%(1 枠の測り)」です。
+[測定と但し書き](docs/bundle2-measurements.md)を参照してください。
+
+- フォークの commit: `af368fcdd` が H35a、`899fc4e16` が起動スクリプトの既定値です。
+  H35a は batch size 1 の時だけ効きます。
+- フォークの `serve-fast.sh` は、`HB_BUNDLE2=1`(既定)の時、測った構成(wa・STACK_D=1・
+  E_DRAFT=1・OEA=0・sparse RS 有効)の時だけ、2 つの旗を設定します。normal 版の既定値は
+  この構成に当たり、hyper pro 版は OEA=1 です。呼び出し側が置いた値はそのまま使い、
+  `HB_BUNDLE2=0` ではどちらの旗も設定しません。
+- 適用順は pristine FlashInfer 0.6.17 → VT → H40 です。[H40 の手順](patches/flashinfer/2026-11-08/README.md)を
+  参照してください。H40 は build 時に patch として VT module に組み込まれるため、build 後は常に有効で、
+  `HB_BUNDLE2=0` でも切れません。H40 を外す場合は、`patches/flashinfer/2026-11-08/h40.patch` を
+  当てずに VT module を build し直してください。
+
+
 ## 結果
 
 この章の表は 2026 年 9 月時点のものです。2026-10-02 の本番版と変更点は、下の「[2026 年 10 月の更新](#2026-年-10-月の更新)」にあります。

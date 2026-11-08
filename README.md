@@ -237,6 +237,27 @@ Model weights have separate terms from this code. Read the model cards and linke
 - [bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4/tree/df3922b21fc28a8604cc9b31451495690d155194) (revision `df3922b`): its LICENSE file is the Qwen Community License 1.0, which sets conditions on some commercial uses.
 - [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/tree/7b719225242aacd3dbd3f9407468c2ee9a9d2594) (revision `7b71922`): its card lists the license as `other` and refers to the source model for terms.
 
+## 2026-11-08 bundle 2 preparation
+
+Bundle 2 adds H35a (fused draft-step confidence) and H38 (MTP FC GEMV) defaults to
+the fork's `serve-fast.sh`, plus an H40 patch for VT's small-M MoE prologue.
+The reported gain is about +3% in one measurement window (431.0 → 443.6 tok/s,
++2.91%); see [measurements and limitations](docs/bundle2-measurements.md).
+
+- Fork commits: `af368fcdd` adds H35a and `899fc4e16` adds the launcher defaults.
+  H35a operates only at batch size 1.
+- With `HB_BUNDLE2=1` (default), the fork's `serve-fast.sh` supplies the two flags
+  only for wa with STACK_D=1, E_DRAFT=1, OEA=0 and sparse RS on, the measured
+  configuration. The normal edition's defaults match it; the hyper pro edition
+  sets OEA=1. Values set by the caller are kept, and `HB_BUNDLE2=0` supplies
+  neither flag.
+- Apply pristine FlashInfer 0.6.17 → VT → H40 as described in the
+  [H40 instructions](patches/flashinfer/2026-11-08/README.md). H40 is a build-time
+  patch, so it is always on once the VT module is built with it; `HB_BUNDLE2=0`
+  does not switch it off. To run without H40, rebuild the VT module without
+  `patches/flashinfer/2026-11-08/h40.patch`.
+
+
 ## Results
 
 The tables in this section are the 2026-09 state. The 2026-10-02 production build and what changed are in
