@@ -1,7 +1,8 @@
 # Modified upstream files
 
-Apache License 2.0 §4(b) notice: the SGLang series, FlashInfer patches and overlays, and
-the 2026-10-27 update by aiueo52 and contributors modify the upstream files listed below.
+Apache License 2.0 §4(b) notice: the SGLang series, FlashInfer patches and overlays, the
+2026-10-27 update and the later fork changes listed below by aiueo52 and contributors modify
+the upstream files listed below.
 The SGLang base is
 [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) at
 `16e5682aad6e3335f38ec8d5711176278f12a086` (itself derived from SGLang and, for some files,
@@ -16,13 +17,15 @@ The first table includes existing base-fork files that still differ in the publi
 by the series or update are listed separately where relevant to release maintenance.
 The update column includes release maintenance after the 2026-10-27 performance update,
 including security, notice, docstring/log/error-text and tooling changes. “yes” compares the
-current file with the previous public build, `5105985`; “no” means that the old-series
-version is unchanged by the update. Notice-only changes count as modifications.
+file at the update commit `d21289fb9` with the previous public build, `5105985`; “no” means
+that the old-series version is unchanged by the update, and `–` that the file was first
+modified after the update. The last column names the later fork changes (see “Changes after
+the 2026-10-27 update”). Notice-only changes count as modifications.
 
-Compared with the public base `16e5682`, `python/` has **61 modified, 31 added and
-5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 28 added and 1 removed
+Compared with the public base `16e5682`, `python/` has **65 modified, 40 added and
+5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 34 added and 1 removed
 file**. Of the **2,065 upstream test files**, 2,061 are unchanged, 3 modified and 1 removed,
-for **2,092 files under `test/`**. These are file counts, not test-case counts; all file types
+for **2,098 files under `test/`**. These are file counts, not test-case counts; all file types
 are included, generated Python caches are excluded, and symlinks are compared by type and target.
 
 Old-series patch mappings are retained from the previous table; `–` means no mapping there.
@@ -30,74 +33,78 @@ Patch numbers are the 121 series commits in order after `16e5682aad` (0001 = fir
 the two header commits, and match `patches/sglang/series/` in this repository. Each patch records
 its historical change; the update column records subsequent differences, not new patch numbers.
 
-| file | old series patches | changed by the 2026-10-27 update |
-|---|---|---|
-| `.gitignore` | – | yes |
-| `README.md` | – | yes |
-| `python/sglang/kernels/jit/csrc/elementwise/hc_combine.cuh` | 0054, 0058 | yes |
-| `python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py` | 0001 | yes |
-| `python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py` | 0048, 0070 | yes |
-| `python/sglang/kernels/ops/elementwise/elementwise.py` | 0055, 0071 | yes |
-| `python/sglang/kernels/ops/elementwise/hc_combine.py` | 0054, 0058 | yes |
-| `python/sglang/kernels/ops/mamba/causal_conv1d_triton.py` | 0023, 0045 | yes |
-| `python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py` | – | yes |
-| `python/sglang/kernels/ops/speculative/__init__.py` | 0114, 0115 | yes |
-| `python/sglang/kernels/ops/speculative/eagle.py` | – | yes |
-| `python/sglang/kernels/ops/speculative/reject_sampling.py` | – | yes |
-| `python/sglang/kernels/ops/speculative/topk1.py` | 0016, 0082, 0114, 0115 | yes |
-| `python/sglang/srt/arg_groups/overrides.py` | – | yes |
-| `python/sglang/srt/arg_groups/speculative_hook.py` | 0002 | yes |
-| `python/sglang/srt/environ.py` | 0019, 0042, 0054, 0056, 0059, 0075, 0082, 0107, 0108, 0109, 0112, 0113, 0114, 0115, 0116, 0117, 0118, 0119, 0121 | yes |
-| `python/sglang/srt/entrypoints/http_server.py` | – | yes |
-| `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py` | 0012 | yes |
-| `python/sglang/srt/layers/attention/linear/gdn_backend.py` | 0048 | yes |
-| `python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py` | 0018 | yes |
-| `python/sglang/srt/layers/attention/qsa/graph_metadata.py` | 0005, 0043 | yes |
-| `python/sglang/srt/layers/attention/qsa/metadata.py` | 0005 | yes |
-| `python/sglang/srt/layers/attention/qsa/qsa_indexer.py` | 0005 | yes |
-| `python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py` | 0005, 0015, 0016, 0121 | yes |
-| `python/sglang/srt/layers/hc_mix_triton.py` | 0010 | yes |
-| `python/sglang/srt/layers/hyperconnection.py` | 0003, 0010, 0017, 0025, 0031, 0034, 0040, 0054, 0056, 0059, 0075, 0109 | yes |
-| `python/sglang/srt/layers/linear.py` | 0003, 0099 | yes |
-| `python/sglang/srt/layers/logits_processor.py` | 0032 | yes |
-| `python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py` | 0100, 0103 | yes |
-| `python/sglang/srt/layers/moe/topk.py` | 0019, 0110, 0111 | yes |
-| `python/sglang/srt/layers/quantization/fp8.py` | 0004, 0032, 0040, 0049, 0079, 0098 | yes |
-| `python/sglang/srt/layers/quantization/modelopt_quant.py` | 0003, 0022, 0112 | yes |
-| `python/sglang/srt/layers/quantization/nvfp4_online.py` | 0022 | yes |
-| `python/sglang/srt/managers/overlap_utils.py` | 0116 | yes |
-| `python/sglang/srt/managers/scheduler.py` | – | yes |
-| `python/sglang/srt/managers/tokenizer_manager.py` | – | yes |
-| `python/sglang/srt/managers/utils.py` | – | yes |
-| `python/sglang/srt/mem_cache/kv_cache_configurator.py` | 0005 | yes |
-| `python/sglang/srt/mem_cache/memory_pool.py` | 0019, 0020 | yes |
-| `python/sglang/srt/mem_cache/qsa_kv_pool.py` | 0005 | yes |
-| `python/sglang/srt/model_executor/forward_context.py` | – | yes |
-| `python/sglang/srt/model_executor/input_buffers.py` | 0014 | yes |
-| `python/sglang/srt/model_executor/model_runner.py` | 0004, 0012, 0013 | yes |
-| `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py` | 0012 | yes |
-| `python/sglang/srt/model_executor/runner/eager_runner.py` | 0114 | yes |
-| `python/sglang/srt/models/qwen2_moe.py` | 0003, 0019, 0024, 0040, 0041, 0055, 0057, 0060, 0112 | yes |
-| `python/sglang/srt/models/qwen3_5.py` | 0006, 0007, 0048, 0049, 0050, 0051, 0079, 0109 | yes |
-| `python/sglang/srt/models/qwen3_5_mtp.py` | 0011, 0022 | yes |
-| `python/sglang/srt/models/qwen3_next.py` | 0004 | yes |
-| `python/sglang/srt/models/qwen4_exp.py` | 0003, 0017, 0055, 0056, 0075, 0109 | yes |
-| `python/sglang/srt/models/qwen4_exp_mtp.py` | 0019, 0024, 0042, 0044 | yes |
-| `python/sglang/srt/server_args.py` | 0002, 0003 | yes |
-| `python/sglang/srt/speculative/adaptive_runtime_state.py` | 0012, 0061, 0082, 0104 | yes |
-| `python/sglang/srt/speculative/adaptive_spec_params.py` | 0012, 0061, 0062, 0063, 0066, 0082 | yes |
-| `python/sglang/srt/speculative/base_spec_worker.py` | 0082 | yes |
-| `python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py` | 0106, 0107, 0114, 0116 | yes |
-| `python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py` | 0061 | yes |
-| `python/sglang/srt/speculative/eagle_info.py` | 0116 | yes |
-| `python/sglang/srt/speculative/eagle_utils.py` | 0107, 0108, 0113, 0115, 0116, 0117, 0119 | yes |
-| `python/sglang/srt/speculative/eagle_worker_common.py` | 0115, 0116 | yes |
-| `python/sglang/srt/speculative/eagle_worker_v2.py` | 0004, 0006, 0012, 0014, 0016, 0065, 0082, 0095, 0096, 0104, 0106, 0107, 0114, 0115, 0116, 0117, 0118, 0119 | yes |
-| `python/sglang/srt/speculative/spec_info.py` | 0002, 0116, 0117, 0119 | yes |
-| `python/sglang/srt/speculative/spec_utils.py` | 0106, 0107, 0108, 0113, 0116, 0117, 0118, 0119 | yes |
-| `test/registered/kernels/ops/speculative/test_spec_topk1.py` | 0114, 0115 | no |
-| `test/registered/unit/models/test_qwen4_exp_mtp.py` | 0044 | no |
-| `test/registered/unit/spec/test_adaptive_spec_params.py` | 0063 | no |
+| file | old series patches | changed by the 2026-10-27 update | changed later |
+|---|---|---|---|
+| `.gitignore` | – | yes | – |
+| `README.md` | – | yes | README text and the counts above |
+| `python/sglang/kernels/jit/csrc/elementwise/hc_combine.cuh` | 0054, 0058 | yes | – |
+| `python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py` | 0001 | yes | – |
+| `python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py` | 0048, 0070 | yes | – |
+| `python/sglang/kernels/ops/elementwise/elementwise.py` | 0055, 0071 | yes | – |
+| `python/sglang/kernels/ops/elementwise/hc_combine.py` | 0054, 0058 | yes | – |
+| `python/sglang/kernels/ops/mamba/causal_conv1d_triton.py` | 0023, 0045 | yes | – |
+| `python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py` | – | yes | – |
+| `python/sglang/kernels/ops/speculative/__init__.py` | 0114, 0115 | yes | – |
+| `python/sglang/kernels/ops/speculative/eagle.py` | – | yes | – |
+| `python/sglang/kernels/ops/speculative/reject_sampling.py` | – | yes | – |
+| `python/sglang/kernels/ops/speculative/topk1.py` | 0016, 0082, 0114, 0115 | yes | – |
+| `python/sglang/srt/arg_groups/overrides.py` | – | yes | – |
+| `python/sglang/srt/arg_groups/speculative_hook.py` | 0002 | yes | – |
+| `python/sglang/srt/environ.py` | 0019, 0042, 0054, 0056, 0059, 0075, 0082, 0107, 0108, 0109, 0112, 0113, 0114, 0115, 0116, 0117, 0118, 0119, 0121 | yes | expert tier |
+| `python/sglang/srt/entrypoints/http_server.py` | – | yes | – |
+| `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py` | 0012 | yes | – |
+| `python/sglang/srt/layers/attention/linear/gdn_backend.py` | 0048 | yes | – |
+| `python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py` | 0018 | yes | – |
+| `python/sglang/srt/layers/attention/qsa/graph_metadata.py` | 0005, 0043 | yes | – |
+| `python/sglang/srt/layers/attention/qsa/metadata.py` | 0005 | yes | – |
+| `python/sglang/srt/layers/attention/qsa/qsa_indexer.py` | 0005 | yes | – |
+| `python/sglang/srt/layers/attention/qsa/sparse_attn.py` | – | – | expert tier |
+| `python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py` | 0005, 0015, 0016, 0121 | yes | expert tier |
+| `python/sglang/srt/layers/hc_mix_triton.py` | 0010 | yes | – |
+| `python/sglang/srt/layers/hyperconnection.py` | 0003, 0010, 0017, 0025, 0031, 0034, 0040, 0054, 0056, 0059, 0075, 0109 | yes | – |
+| `python/sglang/srt/layers/linear.py` | 0003, 0099 | yes | – |
+| `python/sglang/srt/layers/logits_processor.py` | 0032 | yes | – |
+| `python/sglang/srt/layers/moe/fused_moe_triton/layer.py` | – | – | expert tier |
+| `python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py` | 0100, 0103 | yes | expert tier |
+| `python/sglang/srt/layers/moe/topk.py` | 0019, 0110, 0111 | yes | – |
+| `python/sglang/srt/layers/quantization/fp8.py` | 0004, 0032, 0040, 0049, 0079, 0098 | yes | – |
+| `python/sglang/srt/layers/quantization/modelopt_quant.py` | 0003, 0022, 0112 | yes | expert tier |
+| `python/sglang/srt/layers/quantization/nvfp4_online.py` | 0022 | yes | – |
+| `python/sglang/srt/managers/overlap_utils.py` | 0116 | yes | – |
+| `python/sglang/srt/managers/scheduler.py` | – | yes | – |
+| `python/sglang/srt/managers/tokenizer_manager.py` | – | yes | – |
+| `python/sglang/srt/managers/utils.py` | – | yes | – |
+| `python/sglang/srt/mem_cache/kv_cache_configurator.py` | 0005 | yes | expert tier |
+| `python/sglang/srt/mem_cache/memory_pool.py` | 0019, 0020 | yes | – |
+| `python/sglang/srt/mem_cache/pool_host/base.py` | – | – | HiCache prepin |
+| `python/sglang/srt/mem_cache/pool_host/common.py` | – | – | HiCache prepin |
+| `python/sglang/srt/mem_cache/qsa_kv_pool.py` | 0005 | yes | – |
+| `python/sglang/srt/model_executor/forward_context.py` | – | yes | – |
+| `python/sglang/srt/model_executor/input_buffers.py` | 0014 | yes | – |
+| `python/sglang/srt/model_executor/model_runner.py` | 0004, 0012, 0013 | yes | HiCache prepin |
+| `python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py` | 0012 | yes | – |
+| `python/sglang/srt/model_executor/runner/eager_runner.py` | 0114 | yes | – |
+| `python/sglang/srt/models/qwen2_moe.py` | 0003, 0019, 0024, 0040, 0041, 0055, 0057, 0060, 0112 | yes | – |
+| `python/sglang/srt/models/qwen3_5.py` | 0006, 0007, 0048, 0049, 0050, 0051, 0079, 0109 | yes | – |
+| `python/sglang/srt/models/qwen3_5_mtp.py` | 0011, 0022 | yes | – |
+| `python/sglang/srt/models/qwen3_next.py` | 0004 | yes | – |
+| `python/sglang/srt/models/qwen4_exp.py` | 0003, 0017, 0055, 0056, 0075, 0109 | yes | expert tier |
+| `python/sglang/srt/models/qwen4_exp_mtp.py` | 0019, 0024, 0042, 0044 | yes | – |
+| `python/sglang/srt/server_args.py` | 0002, 0003 | yes | – |
+| `python/sglang/srt/speculative/adaptive_runtime_state.py` | 0012, 0061, 0082, 0104 | yes | – |
+| `python/sglang/srt/speculative/adaptive_spec_params.py` | 0012, 0061, 0062, 0063, 0066, 0082 | yes | – |
+| `python/sglang/srt/speculative/base_spec_worker.py` | 0082 | yes | – |
+| `python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py` | 0106, 0107, 0114, 0116 | yes | – |
+| `python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py` | 0061 | yes | – |
+| `python/sglang/srt/speculative/eagle_info.py` | 0116 | yes | – |
+| `python/sglang/srt/speculative/eagle_utils.py` | 0107, 0108, 0113, 0115, 0116, 0117, 0119 | yes | – |
+| `python/sglang/srt/speculative/eagle_worker_common.py` | 0115, 0116 | yes | – |
+| `python/sglang/srt/speculative/eagle_worker_v2.py` | 0004, 0006, 0012, 0014, 0016, 0065, 0082, 0095, 0096, 0104, 0106, 0107, 0114, 0115, 0116, 0117, 0118, 0119 | yes | sparse-RS confidence |
+| `python/sglang/srt/speculative/spec_info.py` | 0002, 0116, 0117, 0119 | yes | – |
+| `python/sglang/srt/speculative/spec_utils.py` | 0106, 0107, 0108, 0113, 0116, 0117, 0118, 0119 | yes | – |
+| `test/registered/kernels/ops/speculative/test_spec_topk1.py` | 0114, 0115 | no | – |
+| `test/registered/unit/models/test_qwen4_exp_mtp.py` | 0044 | no | – |
+| `test/registered/unit/spec/test_adaptive_spec_params.py` | 0063 | no | – |
 
 ## Patch series (pre-2026-10-27)
 
@@ -266,3 +273,31 @@ this list. A second commit after patch 0121 adds the header to files first modif
 
 The 2026-10-27 update commit refreshes the release tree, modification notices and this inventory
 on top of `5105985`; it is separate from the numbered 121-patch series.
+
+## Changes after the 2026-10-27 update
+
+These later changes are in the published fork only. They are separate from the numbered series,
+from the update column above and from the diffs in `patches/sglang/`, which do not contain them.
+README-only commits change the README text and are not listed separately. Paths are relative to
+the fork.
+
+| change | files |
+|---|---|
+| sparse-RS confidence | Fuses the sparse-RS draft step confidence behind an optional flag. Modifies `python/sglang/srt/speculative/eagle_worker_v2.py`; changes the added `python/sglang/kernels/ops/speculative/sparse_rs.py`. |
+| bundle 2 defaults | `serve-fast.sh` sets the bundle 2 defaults (`HB_BUNDLE2`). |
+| expert tier | Opt-in expert tier (`EXPERT_TIER_K`), off by default. Modifies `environ.py`, `layers/attention/qsa/sparse_attn.py`, `layers/attention/qwen_sparse_attn_backend.py`, `layers/moe/fused_moe_triton/layer.py`, `layers/moe/moe_runner/flashinfer_cutlass.py`, `layers/quantization/modelopt_quant.py`, `mem_cache/kv_cache_configurator.py` and `models/qwen4_exp.py` under `python/sglang/srt/`, and `serve-fast.sh` (including the refusal when `flashinfer-vt` carries an untested overlay). Adds `python/sglang/srt/layers/moe/expert_tier/` (nine files), `adaptive/w16_c8.json`, `docs/expert-tier.md`, `docs/expert-tier.ja.md`, `expert-tier/hot-set.json` and `tools/build_hot_set.py`. |
+| HiCache prepin | With `SGLANG_HICACHE_PREPIN_BYTES`, registers one host arena before the weights load and carves the HiCache host pools from it; pools carved from the arena skip the free-memory check, and pools that do not fit take the previous path and check. Modifies `python/sglang/srt/mem_cache/pool_host/common.py`, `python/sglang/srt/mem_cache/pool_host/base.py`, `python/sglang/srt/model_executor/model_runner.py` and `serve-fast.sh`. Without the variable the previous path is unchanged. |
+
+Added test files from these changes:
+
+| added file | coverage |
+|---|---|
+| `test/registered/kernels/test_qsa_paged_prefill_cpu.py` | QSA paged prefill on CPU (expert tier). |
+| `test/test_build_hot_set.py` | Hot-set builder (expert tier). |
+| `test/test_c8_table.py` | CONC=8 adaptive table (expert tier). |
+| `test/test_expert_tier_interpreter.py` | Expert-tier kernels in the interpreter (expert tier). |
+| `test/test_expert_tier_launcher.py` | Expert-tier launcher settings (expert tier). |
+| `test/test_hicache_prepin_launcher.py` | HiCache prepin launcher settings (HiCache prepin). |
+
+The notice header was added to `sparse_attn.py` and `fused_moe_triton/layer.py`, which the expert
+tier modified without it.
