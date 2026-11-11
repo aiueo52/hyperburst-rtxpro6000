@@ -18,6 +18,7 @@
 | [`what-did-not-work.md`](what-did-not-work.md) | the summary table of rejected ideas (moved from the top-level README) |
 | [`limitations.md`](limitations.md) | limitations and measurement noise, historical configurations (moved from the top-level README) |
 | [`repository-layout.md`](repository-layout.md) | what each top-level directory holds (moved from the top-level README) |
+| [`ja/`](ja/) | Japanese versions of the eight pages above, moved from [`README.ja.md`](../README.ja.md) (日本語) |
 | [`lab-notes/`](lab-notes/) | the original engineering notes, lightly sanitised (paths; all results of evaluations on private data removed) |
 
 The first five pages were written after the fact from the project log and the lab notes. Numbers that
