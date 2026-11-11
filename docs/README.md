@@ -10,6 +10,14 @@
 | [`reproduce.md`](reproduce.md) | how to rebuild the stack and re-run the benchmarks |
 | [`train-your-own-mtp-head.md`](train-your-own-mtp-head.md) | fine-tune the MTP draft head on your own data: dump hook, corpus, self-generation, training recipe, renewal evaluation, write-back, server A/B |
 | [`public-data-mtp-head.md`](public-data-mtp-head.md) | retrain the MTP draft head on public data only: prompt set, generation, extraction, training, offline gate, one server A/B result and its deviations (no weights) |
+| [`updates/2026-11-08.md`](updates/2026-11-08.md) | the 2026-11-08 bundle 2 preparation (moved from the top-level README) |
+| [`updates/2026-10-27.md`](updates/2026-10-27.md) | the 2026-10-27 fork release: editions, requirements, how to run, server access, measured results, assets (moved from the top-level README) |
+| [`updates/2026-10-02.md`](updates/2026-10-02.md) | the 2026-10-02 build: what changed and its measurements (moved from the top-level README) |
+| [`updates/2026-09.md`](updates/2026-09.md) | the September results, exact conditions and the original introduction (moved from the top-level README) |
+| [`how-it-works.md`](how-it-works.md) | the short explanation of how it works, historical configurations (moved from the top-level README) |
+| [`what-did-not-work.md`](what-did-not-work.md) | the summary table of rejected ideas (moved from the top-level README) |
+| [`limitations.md`](limitations.md) | limitations and measurement noise, historical configurations (moved from the top-level README) |
+| [`repository-layout.md`](repository-layout.md) | what each top-level directory holds (moved from the top-level README) |
 | [`lab-notes/`](lab-notes/) | the original engineering notes, lightly sanitised (paths; all results of evaluations on private data removed) |
 
 The first five pages were written after the fact from the project log and the lab notes. Numbers that
