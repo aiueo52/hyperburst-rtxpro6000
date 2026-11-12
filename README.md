@@ -95,6 +95,7 @@ and the [fork README](https://github.com/aiueo52/sglang-rtxpro6000/blob/d21289fb
 | `CONC=4` (default) / `CONC=1` | `CONC=1` is not a one-request admission limit; `CONC=6` is unvalidated | [Concurrency](docs/updates/2026-10-27.md#concurrency-and-adaptive-settings) |
 | `EXPERT_TIER_K=<K>` (opt-in) | keeps K routed experts per MoE layer in VRAM; off by default | [Expert tier](docs/updates/2026-10-27.md#optional-expert-tier-lower-vram) |
 | `HB_BUNDLE2=1` (fork default) | supplies the H35a and H38 flags for the measured `wa` configuration | [2026-11-08](docs/updates/2026-11-08.md) |
+| `SGLANG_QSA_RELATIVE_PREFILL=1` (opt-in, experimental) | request-relative QSA prefill for contexts well above 100,000 tokens; off by default, not bit-exact | [2026-11-12](docs/updates/2026-11-12.md) |
 | `wa` profile | adaptive draft width | [How it works](docs/how-it-works.md) |
 | `w4` / `w16` profiles | draft width 4 / draft width 16 (historical September tables) | [2026-09](docs/updates/2026-09.md) |
 
@@ -163,6 +164,7 @@ Full list (historical September and 2026-10-02 configurations): [`docs/limitatio
 
 | date | what changed | full section |
 |---|---|---|
+| 2026-11-12 | experimental QSA relative prefill setting in the fork, off by default | [2026-11-12](docs/updates/2026-11-12.md) |
 | <a id="2026-11-08-bundle-2-preparation"></a>2026-11-08 | bundle 2 preparation: H35a and H38 launcher defaults, H40 FlashInfer patch | [2026-11-08](docs/updates/2026-11-08.md) |
 | <a id="2026-10-27-update"></a>2026-10-27 | fork release: up to 4 concurrent requests, normal and hyperpro editions, optional expert tier | [2026-10-27](docs/updates/2026-10-27.md) |
 | <a id="2026-10-update"></a>2026-10-02 | fixed-cost cuts, sampling fixes, rejection sampling, 524,288-token context | [2026-10-02](docs/updates/2026-10-02.md) |

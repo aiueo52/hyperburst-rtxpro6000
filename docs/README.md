@@ -10,6 +10,7 @@
 | [`reproduce.md`](reproduce.md) | how to rebuild the stack and re-run the benchmarks |
 | [`train-your-own-mtp-head.md`](train-your-own-mtp-head.md) | fine-tune the MTP draft head on your own data: dump hook, corpus, self-generation, training recipe, renewal evaluation, write-back, server A/B |
 | [`public-data-mtp-head.md`](public-data-mtp-head.md) | retrain the MTP draft head on public data only: prompt set, generation, extraction, training, offline gate, one server A/B result and its deviations (no weights) |
+| [`updates/2026-11-12.md`](updates/2026-11-12.md) | the 2026-11-12 experimental QSA relative prefill setting in the fork (Japanese: [`ja/updates/2026-11-12.md`](ja/updates/2026-11-12.md)) |
 | [`updates/2026-11-08.md`](updates/2026-11-08.md) | the 2026-11-08 bundle 2 preparation (moved from the top-level README) |
 | [`updates/2026-10-27.md`](updates/2026-10-27.md) | the 2026-10-27 fork release: editions, requirements, how to run, server access, measured results, assets (moved from the top-level README) |
 | [`updates/2026-10-02.md`](updates/2026-10-02.md) | the 2026-10-02 build: what changed and its measurements (moved from the top-level README) |

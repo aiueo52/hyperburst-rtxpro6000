@@ -90,6 +90,7 @@ CONC=4 FLASH_NEXT_EDITION=normal bash serve-fast.sh wa  # hyper pro は FLASH_NE
 | `CONC=4`(既定)/ `CONC=1` | `CONC=1` は同時に受け付ける数を 1 件に制限する設定ではありません。`CONC=6` は未検証です | [同時処理](docs/ja/updates/2026-10-27.md#同時処理と先読み幅の設定) |
 | `EXPERT_TIER_K=<K>`(任意) | MoE の層ごとに K 人の専門家を VRAM に置きます。既定は切 | [専門家の置き場](docs/ja/updates/2026-10-27.md#任意-専門家の置き場vram-を減らす) |
 | `HB_BUNDLE2=1`(フォークの既定) | 測った `wa` の構成のときに H35a と H38 の旗を設定します | [2026-11-08](docs/ja/updates/2026-11-08.md) |
+| `SGLANG_QSA_RELATIVE_PREFILL=1`(任意・実験中) | 100,000 トークンを大きく超える入力向けの QSA prefill の計算。既定は切。出力は完全には一致しません | [2026-11-12](docs/ja/updates/2026-11-12.md) |
 | `wa` 設定 | 先読み幅を自動で切り替え | [どうやって速くしたか](docs/ja/how-it-works.md) |
 | `w4` / `w16` 設定 | 先読み幅 4 / 先読み幅 16(過去の 9 月の表) | [2026-09](docs/ja/updates/2026-09.md) |
 
@@ -156,6 +157,7 @@ CONC=4 FLASH_NEXT_EDITION=normal bash serve-fast.sh wa  # hyper pro は FLASH_NE
 
 | 日付 | 変わったこと | 全文 |
 |---|---|---|
+| 2026-11-12 | フォークに実験中の QSA prefill の設定を追加(既定は切) | [2026-11-12](docs/ja/updates/2026-11-12.md) |
 | <a id="2026-年-11-月-8-日の束-2-公開準備"></a>2026-11-08 | 束 2 の公開準備: H35a と H38 の起動スクリプトの既定値、FlashInfer への H40 の patch | [2026-11-08](docs/ja/updates/2026-11-08.md) |
 | <a id="2026-年-10-月-27-日の更新"></a>2026-10-27 | フォークのリリース: 最大 4 件同時、normal と hyperpro の 2 つの版、任意の専門家の置き場 | [2026-10-27](docs/ja/updates/2026-10-27.md) |
 | <a id="2026-年-10-月の更新"></a>2026-10-02 | 固定の手間の削減、温度ありの出力の正しさの修正、リジェクションサンプリング、524,288 トークンの文脈 | [2026-10-02](docs/ja/updates/2026-10-02.md) |

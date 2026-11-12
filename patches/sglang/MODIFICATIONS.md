@@ -22,10 +22,10 @@ that the old-series version is unchanged by the update, and `–` that the file 
 modified after the update. The last column names the later fork changes (see “Changes after
 the 2026-10-27 update”). Notice-only changes count as modifications.
 
-Compared with the public base `16e5682`, `python/` has **65 modified, 40 added and
-5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 34 added and 1 removed
+Compared with the public base `16e5682`, `python/` has **66 modified, 40 added and
+5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 35 added and 1 removed
 file**. Of the **2,065 upstream test files**, 2,061 are unchanged, 3 modified and 1 removed,
-for **2,098 files under `test/`**. These are file counts, not test-case counts; all file types
+for **2,099 files under `test/`**. These are file counts, not test-case counts; all file types
 are included, generated Python caches are excluded, and symlinks are compared by type and target.
 
 Old-series patch mappings are retained from the previous table; `–` means no mapping there.
@@ -57,7 +57,8 @@ its historical change; the update column records subsequent differences, not new
 | `python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py` | 0018 | yes | – |
 | `python/sglang/srt/layers/attention/qsa/graph_metadata.py` | 0005, 0043 | yes | – |
 | `python/sglang/srt/layers/attention/qsa/metadata.py` | 0005 | yes | – |
-| `python/sglang/srt/layers/attention/qsa/qsa_indexer.py` | 0005 | yes | – |
+| `python/sglang/srt/layers/attention/qsa/mqa.py` | – | – | relative prefill |
+| `python/sglang/srt/layers/attention/qsa/qsa_indexer.py` | 0005 | yes | relative prefill |
 | `python/sglang/srt/layers/attention/qsa/sparse_attn.py` | – | – | expert tier |
 | `python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py` | 0005, 0015, 0016, 0121 | yes | expert tier |
 | `python/sglang/srt/layers/hc_mix_triton.py` | 0010 | yes | – |
@@ -283,6 +284,7 @@ the fork.
 
 | change | files |
 |---|---|
+| relative prefill | Experimental `SGLANG_QSA_RELATIVE_PREFILL` (default `0`): request-relative logits and key splitting in `python/sglang/srt/layers/attention/qsa/mqa.py` and `python/sglang/srt/layers/attention/qsa/qsa_indexer.py`. Backported from jpezzulli/sglang-rtxpro6000 commit `d4703ed417393655ad84b1062b474b674a238393` (Apache-2.0). `mqa.py` is first modified here; `qsa_indexer.py` was already modified. See README and RESULTS for activation and evidence limits. |
 | sparse-RS confidence | Fuses the sparse-RS draft step confidence behind an optional flag. Modifies `python/sglang/srt/speculative/eagle_worker_v2.py`; changes the added `python/sglang/kernels/ops/speculative/sparse_rs.py`. |
 | bundle 2 defaults | `serve-fast.sh` sets the bundle 2 defaults (`HB_BUNDLE2`). |
 | expert tier | Opt-in expert tier (`EXPERT_TIER_K`), off by default. Modifies `environ.py`, `layers/attention/qsa/sparse_attn.py`, `layers/attention/qwen_sparse_attn_backend.py`, `layers/moe/fused_moe_triton/layer.py`, `layers/moe/moe_runner/flashinfer_cutlass.py`, `layers/quantization/modelopt_quant.py`, `mem_cache/kv_cache_configurator.py` and `models/qwen4_exp.py` under `python/sglang/srt/`, and `serve-fast.sh` (including the refusal when `flashinfer-vt` carries an untested overlay). Adds `python/sglang/srt/layers/moe/expert_tier/` (nine files), `adaptive/w16_c8.json`, `docs/expert-tier.md`, `docs/expert-tier.ja.md`, `expert-tier/hot-set.json` and `tools/build_hot_set.py`. |
@@ -293,6 +295,7 @@ Added test files from these changes:
 | added file | coverage |
 |---|---|
 | `test/registered/kernels/test_qsa_paged_prefill_cpu.py` | QSA paged prefill on CPU (expert tier). |
+| `test/registered/kernels/test_qsa_relative_prefill_cpu.py` | CPU reference row windows, key-split bounds, host-derived widths and switch-off dispatch (relative prefill). Runs without CUDA or TileLang kernels. |
 | `test/test_build_hot_set.py` | Hot-set builder (expert tier). |
 | `test/test_c8_table.py` | CONC=8 adaptive table (expert tier). |
 | `test/test_expert_tier_interpreter.py` | Expert-tier kernels in the interpreter (expert tier). |

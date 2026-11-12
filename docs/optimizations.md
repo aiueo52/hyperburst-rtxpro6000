@@ -1445,6 +1445,56 @@ only when more logits tie exactly at the cut than the margin; we did not check h
 
 ---
 
+## I. Experimental QSA relative prefill
+
+* **Why.** An opt-in prefill change for very long contexts, well above 100,000
+  tokens. `SGLANG_QSA_RELATIVE_PREFILL` defaults to `0`, keeping the existing
+  prefill path; `1` enables request-relative logits with key splitting in the
+  fork's QSA indexer. Decode speed is unchanged.
+* **How.** In `python/sglang/srt/layers/attention/qsa/mqa.py`, a row's score for
+  a key is stored at a column relative to that row's start. The workspace width
+  is the longest request's compressed-key count rather than all packed batch
+  keys. A further grid dimension splits a row block's key tiles, with split
+  count chosen from device core count, row blocks and key tiles. In
+  `qsa_indexer.py`, the width comes from the metadata's host length tuple or
+  the scheduler's CPU lengths. Top-k reads only each row's own relative range,
+  then block indices are expanded to token indices as before. The on path
+  needs CUDA, TileLang and a positive host-derived width; otherwise the stock
+  path runs. It logs `QSA_RELATIVE_PREFILL_ACTIVE` once per indexer on first use.
+* **Measured setting.** One RTX PRO 6000 Blackwell Max-Q, one stream (c=1),
+  `wa` in `serve-fast.sh`, context length 208,896, memory fraction 0.90,
+  thinking off. The pre-release tree's two QSA files match the backport apart
+  from the knob name and comment header. The speed and quality numbers have not been
+  re-measured on the public tree, nor on other modes or concurrency above 1.
+  A short operation check on the public tree (2026-11-12, one launch per arm,
+  the same 60 about-200,000-token lookup questions per arm) gave 53/60 correct
+  with the knob off and 52/60 with it on; the on launch logged
+  `QSA_RELATIVE_PREFILL_ACTIVE` and the off launch did not. That check is too
+  small to measure quality or speed.
+* **Effect (off → on).** Server-side prefill for 4,096 new tokens after 200,000
+  cached tokens (2026-11-11, 6 measurements per arm, alternating launches):
+  median 0.431 s → 0.343 s (-20.3%); ranges 0.421-0.440 s and 0.340-0.350 s.
+  The 16-token continuations were not identical in every pair. Client wall time
+  for about 4,000 new tokens after 200,000 cached tokens, including a 5-token
+  answer and HTTP round trip (2026-11-12, 16 requests per arm over two sessions
+  of 4 launches each): mean 1.115 s → 0.984 s (about -12%). Per session:
+  about -17% (6 per arm) and about -9% (10 per arm); launch-to-launch variation
+  is about 0.1 s, the same size as the gain. Short questions after the long
+  prompt is cached showed no measurable difference.
+* **Correctness.** Not bit-exact: outputs are not token-identical to the off
+  path. The 2026-11-12 synthetic about-200,000-token lookup run used 4 launches
+  in off/on/on/off order, 300 questions per launch (240 single lookup and
+  60 similar id), 1,200 total. The pass rule was fixed beforehand: on may be at
+  most 15 questions below off out of 600. Off scored 536/600 (420/480 single
+  lookup, 116/120 similar id); on scored 538/600 (423/480, 115/120).
+* **Limits.** Real documents, code or conversations, thinking mode, multi-step
+  reasoning over long contexts, concurrency above 1 and other serve modes were
+  not tested. With thinking off the model fails two-step lookups at 100,000
+  tokens and above with either setting.
+* **Source.** Backported from [jpezzulli/sglang-rtxpro6000 commit d4703ed417393655ad84b1062b474b674a238393](https://github.com/jpezzulli/sglang-rtxpro6000/commit/d4703ed417393655ad84b1062b474b674a238393)
+  (Apache-2.0). This is a later optional backport, separate from the historical
+  numbered patch series.
+
 ## Appendix: production flags (as of 2026-09-08; the 2026-10 additions at the end)
 
 | Flag / argument | Section | Profiles |
